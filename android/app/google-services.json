@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "157694944011",
+    "project_id": "vext-vigilantmesh-57551",
+    "storage_bucket": "vext-vigilantmesh-57551.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:157694944011:android:4f2367dd58d730d22e780e",
+        "android_client_info": {
+          "package_name": "com.vext.vext_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAI1jE9Fyb0ZzA5BRAbIkog_uh7dsnwX-4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
