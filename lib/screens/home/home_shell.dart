@@ -2,8 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
-import '../providers/ble_provider.dart'; // adjust to your project structure
-import '../theme/app_theme.dart'; // adjust to your project structure
+import '../../core/app_theme.dart';
+import '../../providers/ble_provider.dart';
 
 // ── Tab definition ────────────────────────────────────────────────────────────
 
@@ -257,12 +257,12 @@ class _SosBadge extends StatelessWidget {
       decoration: BoxDecoration(
         color: isSelected
             ? _AppShellColors.sos
-            : _AppShellColors.sos.withOpacity(0.14),
+            : _AppShellColors.sos.withValues(alpha: 0.14),
         borderRadius: BorderRadius.circular(20),
         boxShadow: isSelected
             ? [
                 BoxShadow(
-                  color: _AppShellColors.sos.withOpacity(0.35),
+                  color: _AppShellColors.sos.withValues(alpha: 0.35),
                   blurRadius: 8,
                   offset: const Offset(0, 2),
                 ),
@@ -386,7 +386,7 @@ class _PulsingDotState extends State<_PulsingDot>
             height: 14,
             decoration: BoxDecoration(
               shape: BoxShape.circle,
-              color: widget.color.withOpacity(0.25 * _pulse.value),
+              color: widget.color.withValues(alpha: 0.25 * _pulse.value),
             ),
           ),
           // Inner solid dot

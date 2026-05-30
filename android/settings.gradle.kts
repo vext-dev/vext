@@ -20,6 +20,9 @@ pluginManagement {
 plugins {
     id("dev.flutter.flutter-plugin-loader") version "1.0.0"
     id("com.android.application") version "8.11.1" apply false
+    // FlutterFire — 4.4.2 aligns with Firebase BOM 33.x used by our packages.
+    // 4.3.15 was EOL and mismatched the Firebase Android SDK versions we depend on.
+    id("com.google.gms.google-services") version "4.4.2" apply false
     id("org.jetbrains.kotlin.android") version "2.2.20" apply false
 }
 

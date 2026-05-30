@@ -1,8 +1,82 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- ══════════════════════════════════════════════════════════════════════
+         NETWORK
+         ══════════════════════════════════════════════════════════════════════ -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- ══════════════════════════════════════════════════════════════════════
+         BLUETOOTH / BLE
+         Android 12+ (API 31+): new granular permissions
+         ══════════════════════════════════════════════════════════════════════ -->
+    <!-- Scan for nearby BLE devices. neverForLocation = no location inference -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation"
+        tools:targetApi="31" />
+    <!-- Connect/pair with BLE peers -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_CONNECT"
+        tools:targetApi="31" />
+    <!-- Advertise this device as a BLE peripheral -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_ADVERTISE"
+        tools:targetApi="31" />
+
+    <!-- Android 11 and below: classic BLE permissions (maxSdkVersion caps them) -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_ADMIN"
+        android:maxSdkVersion="30" />
+
+    <!-- ══════════════════════════════════════════════════════════════════════
+         LOCATION  (required by BLE scanning on all Android versions)
+         ══════════════════════════════════════════════════════════════════════ -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- Background location allows BLE mesh to continue scanning when the
+         app is pushed to the background / enters Doze mode -->
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+
+    <!-- ══════════════════════════════════════════════════════════════════════
+         FOREGROUND SERVICE
+         Android 14 (API 34) requires declaring the service type in both the
+         permission element AND the <service> tag.
+         ══════════════════════════════════════════════════════════════════════ -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- connectedDevice type covers BLE GATT / HFP / etc. -->
+    <uses-permission
+        android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE"
+        tools:targetApi="34" />
+
+    <!-- ══════════════════════════════════════════════════════════════════════
+         MISC
+         ══════════════════════════════════════════════════════════════════════ -->
+    <!-- Vibrate on SOS alert -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- Keep CPU running while BLE scanning in background (Doze bypass) -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- POST_NOTIFICATIONS: required on Android 13+ to show FCM / SOS banners -->
+    <uses-permission
+        android:name="android.permission.POST_NOTIFICATIONS"
+        tools:targetApi="33" />
+
+    <!-- ══════════════════════════════════════════════════════════════════════
+         HARDWARE FEATURES
+         android:required="true" means the Play Store will only show VEXT
+         on devices with a BLE chip.
+         ══════════════════════════════════════════════════════════════════════ -->
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
+
     <application
-        android:label="vext"
+        android:label="VEXT"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
+
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -12,34 +86,38 @@
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
             android:hardwareAccelerated="true"
             android:windowSoftInputMode="adjustResize">
-            <!-- Specifies an Android theme to apply to this Activity as soon as
-                 the Android process has started. This theme is visible to the user
-                 while the Flutter UI initializes. After that, this theme continues
-                 to determine the Window background behind the Flutter UI. -->
             <meta-data
-              android:name="io.flutter.embedding.android.NormalTheme"
-              android:resource="@style/NormalTheme"
-              />
+                android:name="io.flutter.embedding.android.NormalTheme"
+                android:resource="@style/NormalTheme" />
             <intent-filter>
-                <action android:name="android.intent.action.MAIN"/>
-                <category android:name="android.intent.category.LAUNCHER"/>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-        <!-- Don't delete the meta-data below.
-             This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
+
+        <!-- ── NOTE: Plugin-managed services are intentionally NOT declared here.
+             flutter_background_service registers BackgroundService in its own
+             AndroidManifest (android:exported="true"). firebase_messaging registers
+             FirebaseMessagingService in its own manifest. Re-declaring either here
+             causes a manifest merger conflict on android:exported.
+             ──
+             When the VEXT BLE mesh foreground service is written in Milestone 2,
+             add a <service> entry for OUR class (e.g. VextMeshService), NOT
+             for plugin-owned classes.
+             ──────────────────────────────────────────────────────────────── -->
+
+        <!-- Flutter tool meta-data — do not delete -->
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
     </application>
-    <!-- Required to query activities that can process text, see:
-         https://developer.android.com/training/package-visibility and
-         https://developer.android.com/reference/android/content/Intent#ACTION_PROCESS_TEXT.
 
-         In particular, this is used by the Flutter engine in io.flutter.plugin.text.ProcessTextPlugin. -->
+    <!-- Required for Flutter text processing plugin -->
     <queries>
         <intent>
-            <action android:name="android.intent.action.PROCESS_TEXT"/>
-            <data android:mimeType="text/plain"/>
+            <action android:name="android.intent.action.PROCESS_TEXT" />
+            <data android:mimeType="text/plain" />
         </intent>
     </queries>
+
 </manifest>

@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 
-import '../providers/auth_service_provider.dart'; // adjust to your project structure
-import '../theme/app_theme.dart'; // adjust to your project structure
+import '../../core/app_router.dart';
+import '../../core/app_theme.dart';
+import '../../providers/auth_service_provider.dart';
 
 class SignupScreen extends ConsumerStatefulWidget {
   const SignupScreen({super.key});
@@ -111,7 +113,7 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
       );
 
       if (mounted) {
-        Navigator.of(context).pushReplacementNamed('/role-selection');
+        context.go(AppRoutes.roleSelection);
       }
     } catch (e) {
       if (mounted) {
@@ -323,7 +325,7 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
                               backgroundColor: AppTheme.primaryColor,
                               foregroundColor: AppTheme.onPrimaryColor,
                               disabledBackgroundColor:
-                                  AppTheme.primaryColor.withOpacity(0.6),
+                                  AppTheme.primaryColor.withValues(alpha: 0.6),
                               elevation: 0,
                               shape: RoundedRectangleBorder(
                                 borderRadius: BorderRadius.circular(12),
@@ -367,7 +369,7 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
                       ),
                       TextButton(
                         onPressed: () =>
-                            Navigator.of(context).pushReplacementNamed('/login'),
+                            context.go(AppRoutes.login),
                         style: TextButton.styleFrom(
                           foregroundColor: AppTheme.primaryColor,
                           padding: const EdgeInsets.symmetric(horizontal: 6),
@@ -403,7 +405,7 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
     return InputDecoration(
       hintText: hint,
       hintStyle:
-          TextStyle(color: AppTheme.secondaryTextColor.withOpacity(0.6)),
+          TextStyle(color: AppTheme.secondaryTextColor.withValues(alpha: 0.6)),
       prefixIcon:
           Icon(prefixIcon, color: AppTheme.secondaryTextColor, size: 20),
       suffixIcon: suffix,

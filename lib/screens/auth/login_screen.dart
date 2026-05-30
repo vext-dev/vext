@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 
-import '../providers/auth_service_provider.dart'; // adjust import to your project structure
-import '../theme/app_theme.dart'; // adjust import to your project structure
+import '../../core/app_router.dart';
+import '../../core/app_theme.dart';
+import '../../providers/auth_service_provider.dart';
 
 class LoginScreen extends ConsumerStatefulWidget {
   const LoginScreen({super.key});
@@ -233,7 +235,7 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
                               backgroundColor: AppTheme.primaryColor,
                               foregroundColor: AppTheme.onPrimaryColor,
                               disabledBackgroundColor:
-                                  AppTheme.primaryColor.withOpacity(0.6),
+                                  AppTheme.primaryColor.withValues(alpha: 0.6),
                               elevation: 0,
                               shape: RoundedRectangleBorder(
                                 borderRadius: BorderRadius.circular(12),
@@ -277,7 +279,7 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
                       ),
                       TextButton(
                         onPressed: () =>
-                            Navigator.of(context).pushNamed('/signup'),
+                            context.push(AppRoutes.signup),
                         style: TextButton.styleFrom(
                           foregroundColor: AppTheme.primaryColor,
                           padding: const EdgeInsets.symmetric(horizontal: 6),
@@ -312,7 +314,7 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
   }) {
     return InputDecoration(
       hintText: hint,
-      hintStyle: TextStyle(color: AppTheme.secondaryTextColor.withOpacity(0.6)),
+      hintStyle: TextStyle(color: AppTheme.secondaryTextColor.withValues(alpha: 0.6)),
       prefixIcon: Icon(prefixIcon, color: AppTheme.secondaryTextColor, size: 20),
       suffixIcon: suffix,
       filled: true,
