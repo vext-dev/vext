@@ -9,6 +9,7 @@ import '../screens/auth/signup_screen.dart';
 import '../screens/home/home_shell.dart';
 import '../screens/attendance/attendance_screen.dart';
 import '../screens/profile/profile_screen.dart';
+import '../screens/test_screen.dart'; // TODO: remove after Milestone 3 testing
 
 // ── Route path constants ──────────────────────────────────────────────────────
 
@@ -17,6 +18,8 @@ abstract class AppRoutes {
   static const String login = '/login';
   static const String signup = '/signup';
   static const String roleSelection = '/role-selection';
+  // TODO: remove /test after Milestone 3 testing is complete
+  static const String test = '/test';
   static const String attendance = '/home/attendance';
   static const String social = '/home/social';
   static const String sos = '/home/sos';
@@ -35,22 +38,29 @@ final routerProvider = Provider<GoRouter>((ref) {
     debugLogDiagnostics: false,
 
     redirect: (context, state) {
-      // Still loading Firebase auth — show splash, do nothing.
+      // Still loading Firebase auth — keep showing splash, do nothing.
       if (authState.isLoading) return null;
 
       final isLoggedIn = authState.valueOrNull != null;
       final path = state.uri.toString();
 
-      final isAuthPage = path == AppRoutes.splash ||
-          path == AppRoutes.login ||
+      // Splash is only a loading placeholder — never a final destination.
+      // Once auth state is known, always navigate away from it.
+      if (path == AppRoutes.splash) {
+        // TODO: change AppRoutes.test → AppRoutes.attendance after M3 testing
+        return isLoggedIn ? AppRoutes.test : AppRoutes.login;
+      }
+
+      final isAuthPage = path == AppRoutes.login ||
           path == AppRoutes.signup ||
           path == AppRoutes.roleSelection;
 
-      // Not logged in → force to login.
+      // Not logged in and trying to reach a protected route → force to login.
       if (!isLoggedIn && !isAuthPage) return AppRoutes.login;
 
-      // Logged in + on an auth page → go to main app.
-      if (isLoggedIn && isAuthPage) return AppRoutes.attendance;
+      // Logged in but still on an auth page → go to test screen (M3 testing).
+      // TODO: change AppRoutes.test → AppRoutes.attendance after M3 testing
+      if (isLoggedIn && isAuthPage) return AppRoutes.test;
 
       return null;
     },
@@ -60,6 +70,13 @@ final routerProvider = Provider<GoRouter>((ref) {
       GoRoute(
         path: AppRoutes.splash,
         builder: (context, state) => const _SplashScreen(),
+      ),
+
+      // ── Mesh test screen (Milestone 3 testing only) ──────────────────────────
+      // TODO: remove this route after M3 testing is complete
+      GoRoute(
+        path: AppRoutes.test,
+        builder: (context, state) => const TestScreen(),
       ),
 
       // ── Auth flow ────────────────────────────────────────────────────────────
