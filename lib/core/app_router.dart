@@ -3,13 +3,16 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../providers/auth_service_provider.dart';
+import '../services/auth_service.dart'; // VextUser type used in _RouterNotifier
 import '../screens/auth/login_screen.dart';
 import '../screens/auth/role_selection_screen.dart';
 import '../screens/auth/signup_screen.dart';
 import '../screens/home/home_shell.dart';
 import '../screens/attendance/attendance_screen.dart';
 import '../screens/profile/profile_screen.dart';
-import '../screens/test_screen.dart'; // TODO: remove after Milestone 3 testing
+import '../screens/test_screen.dart'; // TODO: remove after Milestone 3 testing is complete
+import '../lanes/attendance/screens/teacher_session_screen.dart';
+import '../lanes/attendance/screens/student_attendance_screen.dart';
 
 // ── Route path constants ──────────────────────────────────────────────────────
 
@@ -18,49 +21,127 @@ abstract class AppRoutes {
   static const String login = '/login';
   static const String signup = '/signup';
   static const String roleSelection = '/role-selection';
-  // TODO: remove /test after Milestone 3 testing is complete
+  // NOTE: Keep /test route alive until Milestone 3 two-phone peer test is signed off.
+  // TODO: remove /test and the TestScreen import after M3 sign-off.
   static const String test = '/test';
   static const String attendance = '/home/attendance';
+  // M4 sub-routes — Milestone 4 (Lane A)
+  static const String teacherSession = '/home/attendance/teacher-session';
+  static const String studentAttendance = '/home/attendance/student';
+  // M5 / M6 sub-routes (placeholder — will be filled in those milestones)
   static const String social = '/home/social';
   static const String sos = '/home/sos';
   static const String profile = '/home/profile';
+  // NOTE(logout): Logout is available from:
+  //   • TestScreen AppBar (M3 testing) — already wired
+  //   • ProfileScreen bottom button (M4+) — already wired
+  //   These two entry points must remain functional in every milestone.
 }
+
+// ── RouterNotifier ────────────────────────────────────────────────────────────
+
+/// Bridges Riverpod's [authStateProvider] to GoRouter's [refreshListenable].
+///
+/// WHY THIS EXISTS (Bug fix — GoRouter recreation):
+/// The previous pattern was:
+///   final routerProvider = Provider<GoRouter>((ref) {
+///     final authState = ref.watch(authStateProvider);   // dependency
+///     return GoRouter(...);                             // new instance every time
+///   });
+///
+/// Because [authStateProvider] uses Firestore snapshots(), it fires on EVERY
+/// Firestore document write — not just login/logout. This caused a brand-new
+/// GoRouter to be created multiple times per session, destroying the navigation
+/// stack and causing the sign-out redirect loop (user was sent back to attendance
+/// because the router saw a logged-in user navigating to /login).
+///
+/// The fix: create the GoRouter ONCE. [_RouterNotifier] listens to auth state
+/// and calls [notifyListeners()] to trigger GoRouter's built-in redirect
+/// re-evaluation without rebuilding or replacing the router instance.
+class _RouterNotifier extends ChangeNotifier {
+  _RouterNotifier(Ref ref) {
+    // Listen (not watch) — this fires notifyListeners() on every auth state
+    // change without making _RouterNotifier itself a reactive dependency.
+    ref.listen<AsyncValue<VextUser?>>(
+      authStateProvider,
+      (_, __) => notifyListeners(),
+    );
+  }
+}
+
+final _routerNotifierProvider = Provider<_RouterNotifier>((ref) {
+  return _RouterNotifier(ref);
+});
 
 // ── Router provider ───────────────────────────────────────────────────────────
 
-/// GoRouter wrapped in a Riverpod provider so it can watch auth state
-/// and trigger redirects automatically on sign-in / sign-out.
+/// Stable GoRouter instance — created ONCE for the app lifetime.
+///
+/// Auth-state changes trigger redirect re-evaluation via [refreshListenable],
+/// NOT by recreating the router. Navigation stack is preserved across auth
+/// events (e.g. Firestore document writes during role selection).
 final routerProvider = Provider<GoRouter>((ref) {
-  final authState = ref.watch(authStateProvider);
+  // Watch the notifier so this provider stays alive as long as the notifier does.
+  // The notifier's ChangeNotifier.notifyListeners() drives GoRouter's redirect.
+  final notifier = ref.watch(_routerNotifierProvider);
 
   return GoRouter(
     initialLocation: AppRoutes.splash,
     debugLogDiagnostics: false,
 
+    // refreshListenable: when notifier fires, GoRouter re-runs redirect()
+    // without destroying or replacing the router instance.
+    refreshListenable: notifier,
+
     redirect: (context, state) {
+      // Read (not watch) — we are already notified via refreshListenable.
+      // Using ref.read here avoids a second reactive dependency chain.
+      final authState = ref.read(authStateProvider);
+
       // Still loading Firebase auth — keep showing splash, do nothing.
       if (authState.isLoading) return null;
 
-      final isLoggedIn = authState.valueOrNull != null;
+      final user = authState.valueOrNull;
+      final isLoggedIn = user != null;
+      // Empty role ('') means user is authenticated but has not yet chosen a
+      // role. The router sends them to RoleSelectionScreen in this state.
+      final hasRole = (user?.role ?? '').isNotEmpty;
       final path = state.uri.toString();
 
-      // Splash is only a loading placeholder — never a final destination.
-      // Once auth state is known, always navigate away from it.
+      // Pages that are accessible without a role — login and signup only.
+      // NOTE: roleSelection is intentionally NOT in this list so that a
+      // logged-in user with a role is redirected away from it (no re-selection).
+      final isAuthPage =
+          path == AppRoutes.login || path == AppRoutes.signup;
+
+      // ── Splash ──────────────────────────────────────────────────────────
+      // Splash is a loading placeholder — never a final destination.
       if (path == AppRoutes.splash) {
-        // TODO: change AppRoutes.test → AppRoutes.attendance after M3 testing
-        return isLoggedIn ? AppRoutes.test : AppRoutes.login;
+        if (!isLoggedIn) return AppRoutes.login;
+        if (!hasRole) return AppRoutes.roleSelection;
+        return AppRoutes.attendance;
       }
 
-      final isAuthPage = path == AppRoutes.login ||
-          path == AppRoutes.signup ||
-          path == AppRoutes.roleSelection;
-
-      // Not logged in and trying to reach a protected route → force to login.
+      // ── Not authenticated ────────────────────────────────────────────────
+      // Unauthenticated users reaching any protected route → login.
       if (!isLoggedIn && !isAuthPage) return AppRoutes.login;
 
-      // Logged in but still on an auth page → go to test screen (M3 testing).
-      // TODO: change AppRoutes.test → AppRoutes.attendance after M3 testing
-      if (isLoggedIn && isAuthPage) return AppRoutes.test;
+      // ── Authenticated, no role ───────────────────────────────────────────
+      // Force role selection unless already there.
+      if (isLoggedIn && !hasRole && path != AppRoutes.roleSelection) {
+        return AppRoutes.roleSelection;
+      }
+
+      // ── Authenticated, has role ──────────────────────────────────────────
+      // Don't allow re-visiting roleSelection once a role is set.
+      if (isLoggedIn && hasRole && path == AppRoutes.roleSelection) {
+        return AppRoutes.attendance;
+      }
+
+      // Don't allow returning to login/signup once authenticated + has role.
+      if (isLoggedIn && hasRole && isAuthPage) {
+        return AppRoutes.attendance;
+      }
 
       return null;
     },
@@ -100,16 +181,27 @@ final routerProvider = Provider<GoRouter>((ref) {
           GoRoute(
             path: AppRoutes.attendance,
             builder: (context, state) => const AttendanceScreen(),
+            routes: [
+              // M4 — Lane A sub-routes (navigate with context.push)
+              GoRoute(
+                path: 'teacher-session',
+                builder: (context, state) => const TeacherSessionScreen(),
+              ),
+              GoRoute(
+                path: 'student',
+                builder: (context, state) => const StudentAttendanceScreen(),
+              ),
+            ],
           ),
           GoRoute(
             path: AppRoutes.social,
             builder: (context, state) =>
-                const _PlaceholderScreen(label: 'Social — Coming in Week 3'),
+                const _PlaceholderScreen(label: 'Social — Milestone 6'),
           ),
           GoRoute(
             path: AppRoutes.sos,
             builder: (context, state) =>
-                const _PlaceholderScreen(label: 'SOS — Coming in Week 3'),
+                const _PlaceholderScreen(label: 'SOS — Milestone 5'),
           ),
           GoRoute(
             path: AppRoutes.profile,

@@ -37,6 +37,34 @@ import '../core/proto/mesh_packet.dart';
 import '../services/ble_transport_layer.dart';
 import '../services/drift_service.dart';
 
+// ── AttendanceAdvertisement ────────────────────────────────────────────────────
+//
+// Wraps an advertisement-only attendance packet with its measured RSSI.
+// Advertisement-only packets (senderUid == '') carry only type+ttl+uuid — they
+// have no sessionId/hmacToken payload. However their RSSI from the BLE scan
+// provides the proximity evidence required for attendance proof assembly.
+//
+// In the M4 flow:
+//   • Teacher calls transport.advertisePacket() → Kotlin BleAdvertiser broadcasts
+//     the attendance packet's 18-byte header on the VEXT service UUID.
+//   • Student's scanner picks up the advertisement with real RSSI.
+//   • AttendanceService reads RSSI from this stream for proximity verification.
+//   • Full payload (sessionId + hmacToken) arrives separately via GATT on the
+//     attendancePackets stream (MeshPacket with senderUid != '').
+//
+class AttendanceAdvertisement {
+  const AttendanceAdvertisement({required this.packet, required this.rssi});
+
+  /// The 18-byte advertisement header parsed into a MeshPacket.
+  /// senderUid is '' (unknown until GATT fetch). type == PacketType.attendance.
+  final MeshPacket packet;
+
+  /// RSSI measured by the local scanner at time of advertisement receipt.
+  /// Negative integer (e.g. -65 dBm). Use AppConstants.rssiThresholdDefault (-75)
+  /// as the minimum to accept for attendance.
+  final int rssi;
+}
+
 class MeshService {
   MeshService({
     required BleTransportLayer transport,
@@ -66,10 +94,22 @@ class MeshService {
   final _ackController =
       StreamController<MeshPacket>.broadcast();
 
+  /// Attendance advertisement-only packets with their BLE RSSI value.
+  /// These are the 18-byte advertisement headers scanned from the air —
+  /// they contain NO payload but carry real proximity data (RSSI).
+  /// AttendanceService subscribes to this alongside attendancePackets.
+  final _attendanceAdvController =
+      StreamController<AttendanceAdvertisement>.broadcast();
+
   Stream<MeshPacket> get attendancePackets => _attendanceController.stream;
   Stream<MeshPacket> get messagePackets    => _messageController.stream;
   Stream<MeshPacket> get sosPackets        => _sosController.stream;
   Stream<MeshPacket> get ackPackets        => _ackController.stream;
+
+  /// Attendance BLE advertisement stream — carries real RSSI for proximity proof.
+  /// Emits whenever the scanner receives a peer advertising PacketType.attendance.
+  Stream<AttendanceAdvertisement> get attendanceAdvertisements =>
+      _attendanceAdvController.stream;
 
   // ── Internal state ─────────────────────────────────────────────────────────
 
@@ -107,6 +147,7 @@ class MeshService {
     _messageController.close();
     _sosController.close();
     _ackController.close();
+    _attendanceAdvController.close();
     _initialized = false;
   }
 
@@ -134,12 +175,19 @@ class MeshService {
 
     // ── 2. Advertisement-only packet (18-byte header, no payload) ─────────
     // These come from BLE advertisement service data. They carry only
-    // type + ttl + uuid — enough for dedup and peer awareness, but no
-    // payload to dispatch. Skip lane dispatch; schedule a GATT fetch
-    // in a future milestone (for now just log the peer's existence).
+    // type + ttl + uuid — no senderUid, no payload.
+    //
+    // Special case for Milestone 4 (Lane A):
+    //   Attendance advertisements are forwarded to attendanceAdvertisements
+    //   stream WITH their RSSI so AttendanceService can use real proximity data.
+    //   All other advertisement-only types are still dropped here (no useful
+    //   payload to process without a GATT fetch).
     if (packet.senderUid.isEmpty) {
-      // The peer is advertising — senderUid is unknown until GATT fetch.
-      // Nothing more to do for advertisement-only packets in Milestone 3.
+      if (packet.type == PacketType.attendance) {
+        _attendanceAdvController.add(
+          AttendanceAdvertisement(packet: packet, rssi: rssi),
+        );
+      }
       return;
     }
 

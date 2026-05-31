@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:go_router/go_router.dart';
+import 'package:go_router/go_router.dart'; // retained for context.go(AppRoutes.login) on session-expired path
 
 import '../../core/app_router.dart';
 import '../../core/app_theme.dart';
@@ -57,7 +57,16 @@ class _RoleSelectionScreenState extends ConsumerState<RoleSelectionScreen> {
     try {
       final authService = ref.read(authServiceProvider);
       await authService.updateRole(user.uid, roleId);
-      if (mounted) context.go(AppRoutes.attendance);
+      // NOTE: No context.go() here — navigation is handled reactively.
+      //
+      // authStateChanges uses Firestore snapshots(). When updateRole() writes
+      // the new role to Firestore, the snapshots() listener fires immediately
+      // (via local Firestore cache), updating authStateProvider. The router
+      // sees the non-empty role and redirects to AppRoutes.attendance
+      // automatically — no explicit navigation needed.
+      //
+      // _isLoading stays true until the screen is unmounted by the router.
+      // On error the catch block resets it.
     } catch (e) {
       if (mounted) {
         setState(() {

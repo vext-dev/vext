@@ -94,6 +94,17 @@ class AppDatabase extends _$AppDatabase {
         .get();
   }
 
+  /// Live-updating proof list for [sessionId] — emits on every DB change.
+  /// Used by TeacherSessionScreen to show real-time attendance as students
+  /// arrive and their proofs are written to the local DB and synced back
+  /// by the FirebaseSyncEngine.
+  Stream<List<AttendanceProof>> watchProofsForSession(String sessionId) {
+    return (select(attendanceProofs)
+          ..where((t) => t.sessionId.equals(sessionId))
+          ..orderBy([(t) => OrderingTerm.desc(t.timestamp)]))
+        .watch();
+  }
+
   // ────────────────────────────────────────────────────────────────────────────
   // DAO: MessageRecords
   // ────────────────────────────────────────────────────────────────────────────

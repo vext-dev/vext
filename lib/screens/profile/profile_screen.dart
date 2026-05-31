@@ -1,13 +1,12 @@
-// MILESTONE 4 — Full profile screen (crypto keys, peer count, device fingerprint)
-// builds in Week 2 once CryptoService and Drift DB are wired.
-// This stub compiles, shows real auth data, BLE status, and a working sign-out.
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:go_router/go_router.dart';
+import 'package:go_router/go_router.dart'; // retained for context.push(AppRoutes.test) in _MeshTestButton
 
+import '../../core/app_router.dart';
 import '../../core/app_theme.dart';
 import '../../providers/auth_service_provider.dart';
 import '../../providers/ble_provider.dart';
+import '../../providers/crypto_service_provider.dart';
 
 class ProfileScreen extends ConsumerWidget {
   const ProfileScreen({super.key});
@@ -166,29 +165,14 @@ class _ProfileBody extends ConsumerWidget {
           ),
           const SizedBox(height: 16),
 
-          // ── Device identity card (stub) ─────────────────────────────────
+          // ── Device identity card ────────────────────────────────────────
           _SectionCard(
             title: 'Device Identity',
             children: [
               _InfoRow(
                 icon: Icons.fingerprint,
-                label: 'Crypto Keys',
-                valueWidget: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
-                  decoration: BoxDecoration(
-                    color: AppTheme.primaryColor.withValues(alpha: 0.1),
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: AppTheme.primaryColor.withValues(alpha: 0.3)),
-                  ),
-                  child: const Text(
-                    'Building in Week 2',
-                    style: TextStyle(
-                      color: AppTheme.secondaryTextColor,
-                      fontSize: 11,
-                      fontWeight: FontWeight.w500,
-                    ),
-                  ),
-                ),
+                label: 'Node Fingerprint',
+                valueWidget: _FingerprintChip(),
               ),
             ],
           ),
@@ -197,7 +181,83 @@ class _ProfileBody extends ConsumerWidget {
           // ── Sign out ────────────────────────────────────────────────────
           _SignOutButton(),
           const SizedBox(height: 16),
+
+          // ── Developer: Mesh Test Screen ─────────────────────────────────
+          // TODO: remove this button after Milestone 3 two-phone test is signed off.
+          _MeshTestButton(),
+          const SizedBox(height: 24),
         ],
+      ),
+    );
+  }
+}
+
+// ── Node fingerprint chip ─────────────────────────────────────────────────────
+
+/// Shows the 16-hex-char node fingerprint derived from the X25519 public key.
+/// CryptoService.initialize() is called once at app start via
+/// cryptoServiceProvider — by the time the Profile screen is visible the
+/// future is resolved.
+class _FingerprintChip extends ConsumerWidget {
+  const _FingerprintChip();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final cryptoAsync = ref.watch(cryptoServiceProvider);
+
+    return cryptoAsync.when(
+      loading: () => const SizedBox(
+        width: 16,
+        height: 16,
+        child: CircularProgressIndicator(
+          strokeWidth: 2,
+          color: AppTheme.primaryColor,
+        ),
+      ),
+      error: (_, __) => const Text(
+        'Key error',
+        style: TextStyle(color: AppTheme.errorColor, fontSize: 11),
+      ),
+      data: (crypto) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
+        decoration: BoxDecoration(
+          color: AppTheme.primaryColor.withValues(alpha: 0.1),
+          borderRadius: BorderRadius.circular(8),
+          border:
+              Border.all(color: AppTheme.primaryColor.withValues(alpha: 0.3)),
+        ),
+        child: Text(
+          crypto.fingerprint,
+          style: const TextStyle(
+            color: AppTheme.primaryColor,
+            fontSize: 11,
+            fontWeight: FontWeight.w600,
+            fontFamily: 'monospace',
+            letterSpacing: 1,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ── Mesh test screen button (debug only) ──────────────────────────────────────
+
+/// Developer shortcut to the BLE mesh TestScreen.
+/// TODO: remove after Milestone 3 two-phone peer test is signed off.
+class _MeshTestButton extends StatelessWidget {
+  const _MeshTestButton();
+
+  @override
+  Widget build(BuildContext context) {
+    return TextButton.icon(
+      onPressed: () => context.push(AppRoutes.test),
+      icon: const Icon(Icons.radar_rounded, size: 16),
+      label: const Text('Mesh Test Screen'),
+      style: TextButton.styleFrom(
+        foregroundColor: AppTheme.secondaryTextColor,
+        textStyle: const TextStyle(fontSize: 13, fontWeight: FontWeight.w500),
+        padding: const EdgeInsets.symmetric(vertical: 10),
       ),
     );
   }
@@ -252,7 +312,22 @@ class _SignOutButtonState extends ConsumerState<_SignOutButton> {
     setState(() => _signingOut = true);
     try {
       await ref.read(authServiceProvider).signOut();
-      if (mounted) context.go('/login');
+      // NO explicit context.go() here.
+      //
+      // Calling context.go('/login') immediately after signOut() was the cause
+      // of the sign-out redirect loop: authStateProvider (backed by Firestore
+      // snapshots) hadn't emitted null yet, so the router saw isLoggedIn=true
+      // and intercepted the /login navigation, bouncing the user back to
+      // /attendance.
+      //
+      // With the RouterNotifier fix, signOut() fires Firebase Auth's
+      // authStateChanges(), which propagates to authStateProvider, which calls
+      // _RouterNotifier.notifyListeners(), which triggers GoRouter's redirect.
+      // The redirect sees isLoggedIn=false and navigates to /login
+      // automatically — no explicit call needed.
+      //
+      // _signingOut is intentionally left true until the screen is unmounted
+      // by the router (keeps the spinner visible during the transition).
     } catch (e) {
       if (mounted) {
         setState(() => _signingOut = false);

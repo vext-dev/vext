@@ -8,7 +8,9 @@ class VextUser {
   final String uid;
   final String email;
   final String displayName;
-  final String role; // student | teacher | security
+  // '' (empty) means the user has not yet selected a role.
+  // The router uses this to redirect to RoleSelectionScreen.
+  final String role; // '' | student | teacher | security
   final String institutionId;
   final String publicKeyFingerprint; // set after crypto init
 
@@ -26,7 +28,9 @@ class VextUser {
       uid: uid,
       email: data['email'] as String? ?? '',
       displayName: data['name'] as String? ?? '',
-      role: data['role'] as String? ?? AppConstants.roleStudent,
+      // Default to '' (no role) — empty string means "not yet selected".
+      // The router redirects to RoleSelectionScreen when role is empty.
+      role: data['role'] as String? ?? '',
       institutionId: data['institution_id'] as String? ?? '',
       publicKeyFingerprint: data['public_key'] as String? ?? '',
     );
@@ -70,11 +74,51 @@ class AuthService {
   // ── Auth State Stream ──────────────────────────────────────────────────────
 
   /// Emits [VextUser] when logged in, null when logged out.
-  /// Used by the router to redirect to login/home.
+  ///
+  /// Uses [asyncExpand] + Firestore [snapshots()] instead of a one-shot [get()].
+  /// This gives us two critical properties:
+  ///
+  /// 1. Race-condition safety: Firebase Auth fires [authStateChanges] the moment
+  ///    a user is created — before the Firestore document is written. With [get()]
+  ///    the read races the write and returns null, making the app think the user
+  ///    logged out. With [snapshots()], we emit a stub immediately and then the
+  ///    real user as soon as the document is committed to the local Firestore cache.
+  ///
+  /// 2. Reactive role updates: When [updateRole()] writes to Firestore, the
+  ///    [snapshots()] listener fires automatically. [authStateProvider] updates,
+  ///    the router re-evaluates, and navigation happens without any explicit
+  ///    [context.go()] call in [RoleSelectionScreen].
+  ///
+  /// [asyncExpand] starts a new inner Firestore snapshot stream for each Firebase
+  /// Auth event. For this app (login/logout only; no token-refresh events that
+  /// fire new authStateChanges), this produces exactly one inner stream per session.
   Stream<VextUser?> get authStateChanges {
-    return _auth.authStateChanges().asyncMap((firebaseUser) async {
-      if (firebaseUser == null) return null;
-      return _fetchVextUser(firebaseUser.uid);
+    return _auth.authStateChanges().asyncExpand((firebaseUser) {
+      // Logged out — emit null once and complete the inner stream.
+      if (firebaseUser == null) return Stream.value(null);
+
+      // Logged in — open a real-time Firestore listener on the user document.
+      // This stream emits on every document change (role update, key upload, etc.).
+      return _firestore
+          .collection(AppConstants.fsUsers)
+          .doc(firebaseUser.uid)
+          .snapshots()
+          .map((doc) {
+            if (!doc.exists || doc.data() == null) {
+              // Document not yet written (signup race) or was deleted.
+              // Return a minimal stub so [authStateProvider] stays non-null
+              // and the router knows we ARE logged in — just without a role yet.
+              // The router will redirect to RoleSelectionScreen.
+              return VextUser(
+                uid: firebaseUser.uid,
+                email: firebaseUser.email ?? '',
+                displayName: firebaseUser.displayName ?? '',
+                role: '',        // empty role → RoleSelectionScreen
+                institutionId: '',
+              );
+            }
+            return VextUser.fromMap(firebaseUser.uid, doc.data()!);
+          });
     });
   }
 
@@ -84,12 +128,14 @@ class AuthService {
   // ── Sign Up ────────────────────────────────────────────────────────────────
 
   /// Creates account, stores profile in Firestore.
-  /// [role] must be one of AppConstants.roleStudent / roleTeacher / roleSecurity.
+  ///
+  /// The Firestore document is written with [role: ''] (empty string) so that
+  /// the router correctly routes this user to [RoleSelectionScreen]. Role is
+  /// set by a subsequent call to [updateRole()] from [RoleSelectionScreen].
   Future<VextUser> signUpWithEmail({
     required String email,
     required String password,
     required String name,
-    String role = AppConstants.roleStudent,
   }) async {
     final credential = await _auth.createUserWithEmailAndPassword(
       email: email,
@@ -98,16 +144,17 @@ class AuthService {
 
     final user = credential.user!;
 
-    // Update display name in Firebase Auth
+    // Update display name in Firebase Auth.
     await user.updateDisplayName(name);
 
-    // Create user document in Firestore
+    // Create user document in Firestore with empty role.
+    // Role is assigned in RoleSelectionScreen → updateRole().
     final vextUser = VextUser(
       uid: user.uid,
       email: email,
       displayName: name,
-      role: role,
-      institutionId: 'default', // updated after role selection if needed
+      role: '',            // NO default role — user must select in RoleSelectionScreen
+      institutionId: 'default',
     );
 
     await _firestore
@@ -129,10 +176,27 @@ class AuthService {
       password: password,
     );
 
-    final vextUser = await _fetchVextUser(credential.user!.uid);
+    final firebaseUser = credential.user!;
+    var vextUser = await _fetchVextUser(firebaseUser.uid);
+
     if (vextUser == null) {
-      throw Exception('User profile not found. Please contact support.');
+      // Self-healing: Firestore document was never written (network failure
+      // during signup, or partially-created account). Reconstruct from
+      // Firebase Auth data so the user is not permanently locked out.
+      // They will be routed to RoleSelectionScreen to complete their profile.
+      vextUser = VextUser(
+        uid: firebaseUser.uid,
+        email: firebaseUser.email ?? email,
+        displayName: firebaseUser.displayName ?? '',
+        role: '',
+        institutionId: 'default',
+      );
+      await _firestore
+          .collection(AppConstants.fsUsers)
+          .doc(firebaseUser.uid)
+          .set(vextUser.toMap());
     }
+
     return vextUser;
   }
 

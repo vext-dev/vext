@@ -112,9 +112,20 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
         name: _nameController.text.trim(),
       );
 
-      if (mounted) {
-        context.go(AppRoutes.roleSelection);
-      }
+      // NO explicit context.go() here.
+      //
+      // The previous context.go(AppRoutes.roleSelection) was a race condition:
+      // it fired immediately after signUpWithEmail, but authStateProvider may
+      // not have emitted the new user yet. If authStateProvider was still
+      // AsyncData(null) at that moment, the router's redirect saw
+      // !isLoggedIn && !isAuthPage and sent the user to /login instead.
+      //
+      // The router handles this correctly without any nudge:
+      //   1. signUpWithEmail creates the Firebase user + writes Firestore doc
+      //      (role: '').
+      //   2. authStateChanges fires → authStateProvider emits the new user.
+      //   3. _RouterNotifier.notifyListeners() fires.
+      //   4. GoRouter redirect: isLoggedIn=true, hasRole=false → /role-selection.
     } catch (e) {
       if (mounted) {
         _showErrorSnackBar(_friendlyError(e));

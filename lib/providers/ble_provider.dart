@@ -1,14 +1,14 @@
 // ── BLE Providers ─────────────────────────────────────────────────────────────
 //
-// Milestone 1 had a stub BleStateNotifier with no real BLE operations.
-// Milestone 2 wires the real BleTransportLayer:
-//   • bleTransportLayerProvider  — the BLE scanning/advertising engine
-//   • bleStateProvider           — reactive state (active, mode, peerCount)
-//   • bleActiveProvider          — convenience bool for AppBar indicator
+// Milestone 1: stub BleStateNotifier.
+// Milestone 2: wired real BleTransportLayer.
+// Milestone 3 (post-debug): exposed advertisingActive + advertisingError so the
+//   UI can warn the user when BLUETOOTH_ADVERTISE permission is denied.
 //
-// The BleTransportLayer is created once and lives for the app lifetime.
-// Its callbacks push state updates into BleStateNotifier.
-// MeshService (Milestone 3) will sit between BleTransportLayer and the DB.
+//   • bleTransportLayerProvider  — the BLE engine singleton
+//   • bleStateProvider           — reactive state (active, mode, peerCount,
+//                                  advertisingActive, advertisingError)
+//   • bleActiveProvider          — convenience bool for AppBar indicator
 //
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -18,9 +18,7 @@ import '../services/ble_transport_layer.dart';
 
 // ── MeshMode enum ─────────────────────────────────────────────────────────────
 
-/// High-level mode exposed to the UI.
-/// Maps 1:1 to BleTransportLayer's ScanDutyMode but lives here so UI code
-/// does not import the service layer directly.
+/// High-level mode exposed to the UI. Maps 1:1 to BleTransportLayer.ScanDutyMode.
 enum MeshMode { idle, activeSession, sosMode }
 
 // ── BleState ──────────────────────────────────────────────────────────────────
@@ -31,17 +29,35 @@ class BleState {
     this.isActive = false,
     this.mode = MeshMode.idle,
     this.peerCount = 0,
+    this.advertisingActive = false,
+    this.advertisingError = '',
   });
 
   final bool isActive;
   final MeshMode mode;
   final int peerCount;
 
-  BleState copyWith({bool? isActive, MeshMode? mode, int? peerCount}) {
+  /// True when the Kotlin BleAdvertiser has confirmed advertising started.
+  /// False before start() is called, or when BLUETOOTH_ADVERTISE was denied.
+  final bool advertisingActive;
+
+  /// Non-empty when advertising failed — human-readable error for the UI.
+  /// Empty when advertisingActive = true (success) or before start() is called.
+  final String advertisingError;
+
+  BleState copyWith({
+    bool? isActive,
+    MeshMode? mode,
+    int? peerCount,
+    bool? advertisingActive,
+    String? advertisingError,
+  }) {
     return BleState(
       isActive: isActive ?? this.isActive,
       mode: mode ?? this.mode,
       peerCount: peerCount ?? this.peerCount,
+      advertisingActive: advertisingActive ?? this.advertisingActive,
+      advertisingError: advertisingError ?? this.advertisingError,
     );
   }
 }
@@ -50,42 +66,56 @@ class BleState {
 
 class BleStateNotifier extends StateNotifier<BleState> {
   BleStateNotifier(this._transport) : super(const BleState()) {
-    // Wire transport layer callbacks → state updates.
+    // Wire transport callbacks → state updates.
     _transport.onPeerCountChanged = (count) {
       state = state.copyWith(peerCount: count);
+    };
+
+    // Advertising state: fires after every startAdvertising() attempt.
+    // isAdvertising=true → confirmed running. false + error → needs user action.
+    _transport.onAdvertisingStateChanged = (isAdvertising, error) {
+      state = state.copyWith(
+        advertisingActive: isAdvertising,
+        advertisingError: error,
+      );
     };
   }
 
   final BleTransportLayer _transport;
 
-  // ── Start / stop scanning ──────────────────────────────────────────────────
+  // ── Start / stop ───────────────────────────────────────────────────────────
 
-  /// Begin BLE scanning in idle duty-cycle mode (3% — battery-friendly).
-  /// Call this when the app enters the foreground.
+  /// Idle duty cycle (3%). Use for passive mesh participation.
   Future<void> startIdle() async {
     await _transport.start(mode: ScanDutyMode.idle);
     state = state.copyWith(isActive: true, mode: MeshMode.idle);
   }
 
-  /// Switch to active session mode (50% duty cycle) — called by AttendanceScreen.
+  /// Session duty cycle (50%). Use when attendance or social screen is active.
   Future<void> startSession() async {
     await _transport.start(mode: ScanDutyMode.session);
     state = state.copyWith(isActive: true, mode: MeshMode.activeSession);
   }
 
-  /// Switch to SOS mode (near-continuous scanning) — called by SosScreen.
+  /// SOS duty cycle (near-continuous). Use when SOS is triggered.
   Future<void> startSos() async {
     await _transport.start(mode: ScanDutyMode.sos);
     state = state.copyWith(isActive: true, mode: MeshMode.sosMode);
   }
 
-  /// Stop scanning and return to idle UI state.
+  /// Stop scanning and advertising. Resets to idle UI state.
   Future<void> stopScanning() async {
     await _transport.stop();
-    state = state.copyWith(isActive: false, mode: MeshMode.idle, peerCount: 0);
+    state = state.copyWith(
+      isActive: false,
+      mode: MeshMode.idle,
+      peerCount: 0,
+      advertisingActive: false,
+      advertisingError: '',
+    );
   }
 
-  // ── Direct state setters (kept for compatibility with stub screens) ─────────
+  // ── Compatibility setters (kept for stub screens) ──────────────────────────
 
   void setActive(bool active) {
     state = state.copyWith(isActive: active);
@@ -98,23 +128,18 @@ class BleStateNotifier extends StateNotifier<BleState> {
   void updatePeerCount(int count) {
     state = state.copyWith(peerCount: count);
   }
-
-  // NOTE: _transport lifecycle is owned by bleTransportLayerProvider (onDispose).
-  // Do NOT call _transport.dispose() here — it would double-dispose.
 }
 
 // ── Providers ─────────────────────────────────────────────────────────────────
 
-/// The BLE transport layer singleton.
-/// Created eagerly so BLE scanning can start without awaiting the DB.
+/// The BLE transport layer singleton. Created eagerly.
 final bleTransportLayerProvider = Provider<BleTransportLayer>((ref) {
   final transport = BleTransportLayer();
-  // dispose() is async — wrap in a closure so Riverpod's void onDispose is satisfied.
   ref.onDispose(() => transport.dispose());
   return transport;
 });
 
-/// Full BLE mesh state — isActive, mode, peerCount.
+/// Full BLE mesh state — isActive, mode, peerCount, advertisingActive, error.
 final bleStateProvider =
     StateNotifierProvider<BleStateNotifier, BleState>((ref) {
   final transport = ref.watch(bleTransportLayerProvider);
@@ -122,7 +147,6 @@ final bleStateProvider =
 });
 
 /// Convenience bool — true when BLE scanning is active.
-/// Used by the AppBar BLE status indicator.
 final bleActiveProvider = Provider<bool>((ref) {
   return ref.watch(bleStateProvider).isActive;
 });
