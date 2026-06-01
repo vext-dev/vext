@@ -13,7 +13,8 @@ import '../screens/profile/profile_screen.dart';
 import '../screens/test_screen.dart'; // TODO: remove after Milestone 3 testing is complete
 import '../lanes/attendance/screens/teacher_session_screen.dart';
 import '../lanes/attendance/screens/student_attendance_screen.dart';
-import '../lanes/sos/screens/sos_screen.dart'; // M5 — Lane C
+import '../lanes/sos/screens/sos_screen.dart';    // M5 — Lane C
+import '../lanes/social/screens/social_screen.dart'; // M6 — Lane B
 
 // ── Route path constants ──────────────────────────────────────────────────────
 
@@ -196,8 +197,7 @@ final routerProvider = Provider<GoRouter>((ref) {
           ),
           GoRoute(
             path: AppRoutes.social,
-            builder: (context, state) =>
-                const _PlaceholderScreen(label: 'Social — Milestone 6'),
+            builder: (context, state) => const SocialScreen(), // M6 — Lane B
           ),
           GoRoute(
             path: AppRoutes.sos,

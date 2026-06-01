@@ -135,6 +135,15 @@ class AppDatabase extends _$AppDatabase {
         .write(const MessageRecordsCompanion(synced: Value(true)));
   }
 
+  /// Live-updating message list, newest-first — used by SocialScreen.
+  /// Emits on every insert/delete without manual polling.
+  Stream<List<MessageRecord>> watchAllMessages({int limit = 200}) {
+    return (select(messageRecords)
+          ..orderBy([(t) => OrderingTerm.desc(t.timestamp)])
+          ..limit(limit))
+        .watch();
+  }
+
   /// Delete messages older than the retention period (30 days).
   Future<int> purgeOldMessages(DateTime cutoff) {
     return (delete(messageRecords)
