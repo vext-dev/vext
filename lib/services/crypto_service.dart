@@ -118,7 +118,10 @@ class CryptoService {
   /// Stable across app restarts. Stored in MeshPacket.senderUid and
   /// uploaded to Firestore public_keys/{uid} in Milestone 7.
   String get fingerprint {
-    assert(_fingerprint != null, 'CryptoService.initialize() not called');
+    // Use a runtime null check (not assert — asserts are stripped in release builds).
+    if (_fingerprint == null) {
+      throw StateError('CryptoService.initialize() was not called before accessing fingerprint');
+    }
     return _fingerprint!;
   }
 
@@ -354,12 +357,16 @@ class CryptoService {
       bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
 
   SimpleKeyPair _assertX25519() {
-    assert(_x25519KeyPair != null, 'CryptoService.initialize() not called');
+    if (_x25519KeyPair == null) {
+      throw StateError('CryptoService.initialize() was not called — X25519 keypair not loaded');
+    }
     return _x25519KeyPair!;
   }
 
   SimpleKeyPair _assertEd25519() {
-    assert(_ed25519KeyPair != null, 'CryptoService.initialize() not called');
+    if (_ed25519KeyPair == null) {
+      throw StateError('CryptoService.initialize() was not called — Ed25519 keypair not loaded');
+    }
     return _ed25519KeyPair!;
   }
 }

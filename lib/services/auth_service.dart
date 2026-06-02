@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 
@@ -73,53 +75,93 @@ class AuthService {
 
   // ── Auth State Stream ──────────────────────────────────────────────────────
 
+  // Cached stream and its active Firestore subscription — lazily initialised.
+  // Using a single cached stream ensures all watchers (authStateProvider,
+  // _RouterNotifier) share the same underlying subscription chain.
+  Stream<VextUser?>? _authStateChangesCache;
+  StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? _firestoreSub;
+
   /// Emits [VextUser] when logged in, null when logged out.
   ///
-  /// Uses [asyncExpand] + Firestore [snapshots()] instead of a one-shot [get()].
-  /// This gives us two critical properties:
+  /// Implements SWITCHMAP semantics over Firebase Auth + Firestore snapshots:
+  ///   • Reacts to role updates via Firestore [snapshots()] — reactive role routing.
+  ///   • Cancels the Firestore subscription IMMEDIATELY when Firebase Auth fires
+  ///     a new event (login/logout). This is the critical difference from
+  ///     [asyncExpand], which PAUSES the outer stream while the inner stream is
+  ///     active. Because Firestore [snapshots()] never completes (infinite stream),
+  ///     [asyncExpand] would permanently pause the Firebase Auth outer stream after
+  ///     first login — causing [signOut()] events to be DROPPED by the broadcast
+  ///     stream and sign-out to appear permanently stuck (spinner never stops,
+  ///     router never redirects to /login).
   ///
-  /// 1. Race-condition safety: Firebase Auth fires [authStateChanges] the moment
-  ///    a user is created — before the Firestore document is written. With [get()]
-  ///    the read races the write and returns null, making the app think the user
-  ///    logged out. With [snapshots()], we emit a stub immediately and then the
-  ///    real user as soon as the document is committed to the local Firestore cache.
-  ///
-  /// 2. Reactive role updates: When [updateRole()] writes to Firestore, the
-  ///    [snapshots()] listener fires automatically. [authStateProvider] updates,
-  ///    the router re-evaluates, and navigation happens without any explicit
-  ///    [context.go()] call in [RoleSelectionScreen].
-  ///
-  /// [asyncExpand] starts a new inner Firestore snapshot stream for each Firebase
-  /// Auth event. For this app (login/logout only; no token-refresh events that
-  /// fire new authStateChanges), this produces exactly one inner stream per session.
+  /// This getter is lazy-initialised and returns the same stream on every call,
+  /// since [authServiceProvider] is a singleton and [authStateProvider] subscribes
+  /// exactly once for the app lifetime.
   Stream<VextUser?> get authStateChanges {
-    return _auth.authStateChanges().asyncExpand((firebaseUser) {
-      // Logged out — emit null once and complete the inner stream.
-      if (firebaseUser == null) return Stream.value(null);
+    return _authStateChangesCache ??= _buildAuthStateChanges();
+  }
 
-      // Logged in — open a real-time Firestore listener on the user document.
-      // This stream emits on every document change (role update, key upload, etc.).
-      return _firestore
-          .collection(AppConstants.fsUsers)
-          .doc(firebaseUser.uid)
-          .snapshots()
-          .map((doc) {
-            if (!doc.exists || doc.data() == null) {
-              // Document not yet written (signup race) or was deleted.
-              // Return a minimal stub so [authStateProvider] stays non-null
-              // and the router knows we ARE logged in — just without a role yet.
-              // The router will redirect to RoleSelectionScreen.
-              return VextUser(
-                uid: firebaseUser.uid,
-                email: firebaseUser.email ?? '',
-                displayName: firebaseUser.displayName ?? '',
-                role: '',        // empty role → RoleSelectionScreen
-                institutionId: '',
-              );
-            }
-            return VextUser.fromMap(firebaseUser.uid, doc.data()!);
-          });
-    });
+  Stream<VextUser?> _buildAuthStateChanges() {
+    // Broadcast controller: multiple Riverpod providers can subscribe
+    // (_RouterNotifier via authStateProvider, etc.) without conflict.
+    final controller = StreamController<VextUser?>.broadcast();
+
+    // Subscribe to Firebase Auth. This subscription lives for the app lifetime.
+    _auth.authStateChanges().listen(
+      (firebaseUser) {
+        // ── SWITCHMAP: cancel the old Firestore listener immediately ──────────
+        // This is what asyncExpand DOES NOT do. asyncExpand waits for the inner
+        // stream to complete before processing the next outer event. Firestore
+        // snapshots() NEVER complete, so asyncExpand would block here forever and
+        // the signOut null event would be silently dropped (broadcast streams drop
+        // events to paused subscribers). By cancelling explicitly, we guarantee the
+        // signOut event propagates immediately.
+        _firestoreSub?.cancel();
+        _firestoreSub = null;
+
+        if (firebaseUser == null) {
+          // User signed out — emit null so the router redirects to /login.
+          controller.add(null);
+          return;
+        }
+
+        // User signed in — open a real-time Firestore listener on the user document.
+        // Emits on every document change (role update, key upload, etc.) so the
+        // router can reactively redirect after role selection — no explicit
+        // context.go() call needed anywhere.
+        _firestoreSub = _firestore
+            .collection(AppConstants.fsUsers)
+            .doc(firebaseUser.uid)
+            .snapshots()
+            .listen(
+              (doc) {
+                if (!doc.exists || doc.data() == null) {
+                  // Document not yet written (signup race) or deleted.
+                  // Emit a stub: router sees isLoggedIn=true, hasRole=false
+                  // → redirects to RoleSelectionScreen.
+                  controller.add(VextUser(
+                    uid: firebaseUser.uid,
+                    email: firebaseUser.email ?? '',
+                    displayName: firebaseUser.displayName ?? '',
+                    role: '',        // empty role → RoleSelectionScreen
+                    institutionId: '',
+                  ));
+                } else {
+                  controller.add(VextUser.fromMap(firebaseUser.uid, doc.data()!));
+                }
+              },
+              onError: controller.addError,
+            );
+      },
+      onError: controller.addError,
+      onDone: () {
+        // Firebase Auth stream closed (only happens if the app is torn down).
+        _firestoreSub?.cancel();
+        controller.close();
+      },
+    );
+
+    return controller.stream;
   }
 
   /// Current user synchronously (null if not signed in).
@@ -213,6 +255,13 @@ class AuthService {
   // ── Sign Out ───────────────────────────────────────────────────────────────
 
   Future<void> signOut() async {
+    // Cancel the Firestore snapshot subscription eagerly before Firebase Auth
+    // fires its null event. This is belt-and-suspenders — the _buildAuthStateChanges
+    // listener also cancels it, but doing it here guarantees no Firestore reads
+    // happen after the user session ends (avoids permission-denied errors in
+    // environments with Firestore security rules enabled).
+    _firestoreSub?.cancel();
+    _firestoreSub = null;
     await _auth.signOut();
   }
 

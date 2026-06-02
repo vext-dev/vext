@@ -1,19 +1,133 @@
 rules_version = '2';
 
+// ── VEXT VigilantMesh — Permanent Firestore Security Rules ───────────────────
+//
+// Written: 2026-06-02 (M7 Task 1)
+// Replaces: wide-open test rule that expired 2026-06-22
+//
+// Role system (stored in users/{uid}.role):
+//   "student"  — can mark attendance, send SOS, send messages
+//   "teacher"  — can create sessions, read attendance proofs for their sessions
+//   "security" — can read all SOS events
+//
+// Helper functions are defined at the top to keep match blocks readable.
+// All reads of other documents (get() calls) count against Firestore billing —
+// kept to a minimum and only used where role elevation is required.
+//
+// Collection layout:
+//   users/{uid}
+//   sessions/{sessionId}
+//   attendance/{sessionId}/proofs/{studentUid}
+//   sos_events/{sosId}
+//   messages/{threadId}/records/{msgId}
+// ─────────────────────────────────────────────────────────────────────────────
+
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // This rule allows anyone with your Firestore database reference to view, edit,
-    // and delete all data in your Firestore database. It is useful for getting
-    // started, but it is configured to expire after 30 days because it
-    // leaves your app open to attackers. At that time, all client
-    // requests to your Firestore database will be denied.
-    //
-    // Make sure to write security rules for your app before that time, or else
-    // all client requests to your Firestore database will be denied until you Update
-    // your rules
-    match /{document=**} {
-      allow read, write: if request.time < timestamp.date(2026, 6, 22);
+    // ── Helper: is the request from a signed-in user? ─────────────────────────
+    function isAuthenticated() {
+      return request.auth != null;
     }
+
+    // ── Helper: is the caller the owner of this document (uid == docId)? ──────
+    function isOwner(uid) {
+      return request.auth.uid == uid;
+    }
+
+    // ── Helper: fetch the caller's role from users/{uid} ─────────────────────
+    // Only call this when you genuinely need role elevation — it costs a read.
+    function callerRole() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+
+    function isTeacher() {
+      return isAuthenticated() && callerRole() == 'teacher';
+    }
+
+    function isSecurity() {
+      return isAuthenticated() && callerRole() == 'security';
+    }
+
+    // ── users/{uid} ───────────────────────────────────────────────────────────
+    // Owner can read and write their own profile.
+    // Nobody else can read another user's profile doc (prevents uid enumeration).
+    // Exception: the handleSOSAlert Cloud Function runs as Admin SDK and bypasses
+    // all rules — it can still query users for FCM tokens.
+    match /users/{uid} {
+      allow read:  if isAuthenticated() && isOwner(uid);
+      allow write: if isAuthenticated() && isOwner(uid);
+    }
+
+    // ── sessions/{sessionId} ──────────────────────────────────────────────────
+    // Teachers create and update sessions.
+    // Any authenticated user can read sessions (students need to look up session
+    // metadata when verifying their attendance proof on-device).
+    match /sessions/{sessionId} {
+      allow read:  if isAuthenticated();
+      allow create: if isTeacher();
+      allow update: if isTeacher() &&
+                       resource.data.teacherUid == request.auth.uid;
+      allow delete: if false; // Sessions are never deleted — only marked inactive.
+    }
+
+    // ── attendance/{sessionId}/proofs/{studentUid} ────────────────────────────
+    // A student can create/update only their own proof (auth.uid == studentUid).
+    // The teacher who owns the parent session can read all proofs under it.
+    // Students can also read their own proof.
+    match /attendance/{sessionId}/proofs/{studentUid} {
+      // Student writes their own proof.
+      allow create: if isAuthenticated() && isOwner(studentUid);
+      allow update: if isAuthenticated() && isOwner(studentUid);
+
+      // Student reads their own proof.
+      allow read: if isAuthenticated() && isOwner(studentUid);
+
+      // Teacher reads proofs for sessions they own.
+      // We look up the parent session doc to confirm teacherUid.
+      allow read: if isTeacher() &&
+                     get(/databases/$(database)/documents/sessions/$(sessionId))
+                       .data.teacherUid == request.auth.uid;
+
+      allow delete: if false;
+    }
+
+    // ── sos_events/{sosId} ────────────────────────────────────────────────────
+    // Any authenticated user can create an SOS event (could be a relay node
+    // acting as gateway — the sender UID is embedded in the document).
+    // Security-role users can read all SOS events.
+    // The SOS sender can read their own event.
+    match /sos_events/{sosId} {
+      allow create: if isAuthenticated();
+      allow update: if false; // SOS events are immutable once written.
+      allow delete: if false;
+
+      // Security reads all SOS events for their dashboard.
+      allow read: if isSecurity();
+
+      // Sender can read their own SOS event.
+      allow read: if isAuthenticated() &&
+                     resource.data.senderUid == request.auth.uid;
+    }
+
+    // ── messages/{threadId}/records/{msgId} ───────────────────────────────────
+    // Social lane — any authenticated user can read and write messages.
+    // Content is encrypted end-to-end (Box encryption); Firestore stores only
+    // ciphertext. No role restriction needed here — the crypto layer enforces
+    // confidentiality.
+    // threadId is derived from sorted sender+recipient UIDs in FirebaseSyncEngine.
+    match /messages/{threadId}/records/{msgId} {
+      allow read:   if isAuthenticated();
+      allow create: if isAuthenticated();
+      allow update: if false; // Messages are immutable once sent.
+      allow delete: if false;
+    }
+
+    // ── Catch-all: deny everything not explicitly matched ─────────────────────
+    // Firestore denies by default, but this makes the intent explicit.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
   }
 }
