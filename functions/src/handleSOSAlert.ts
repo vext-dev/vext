@@ -30,6 +30,7 @@ import {
   FirestoreEvent,
   QueryDocumentSnapshot,
 } from 'firebase-functions/v2/firestore';
+import { GlobalOptions } from 'firebase-functions/v2';
 
 // admin.initializeApp() is called once in index.ts — not here.
 
@@ -43,8 +44,17 @@ const NOTIF_TITLE = '🚨 SOS Emergency Alert';
 
 // ── handleSOSAlert ────────────────────────────────────────────────────────────
 
+// Keep one warm instance to eliminate the 10-12s cold start observed in M5 testing.
+// Cost: ~$1.44/month (1 instance × 256 MB × 730 hr). Acceptable for safety-critical path.
+const _sosHandlerOptions: GlobalOptions = {
+  region: 'asia-south1',
+  minInstances: 1,
+  memory: '256MiB',
+  timeoutSeconds: 30,
+};
+
 export const handleSOSAlert = onDocumentCreated(
-  `${FS_SOS_EVENTS}/{sosId}`,
+  { document: `${FS_SOS_EVENTS}/{sosId}`, ..._sosHandlerOptions },
   async (event: FirestoreEvent<QueryDocumentSnapshot | undefined>) => {
     const snap = event.data;
     if (!snap) {

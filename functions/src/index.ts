@@ -12,3 +12,6 @@ admin.initializeApp();
 
 // ── Lane C — SOS ──────────────────────────────────────────────────────────────
 export { handleSOSAlert } from './handleSOSAlert';
+
+// ── Lane A — Attendance aggregation ───────────────────────────────────────────
+export { aggregateAttendance } from './aggregateAttendance';
