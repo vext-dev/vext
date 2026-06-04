@@ -18,8 +18,13 @@
 //
 // ──────────────────────────────────────────────────────────────────────────────
 
+import 'dart:async';
+
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '../../../core/app_constants.dart';
 import '../../../providers/providers.dart';
 import '../sos_service.dart';
 import '../widgets/sos_hold_button.dart';
@@ -43,31 +48,52 @@ class SosScreen extends ConsumerStatefulWidget {
 
 class _SosScreenState extends ConsumerState<SosScreen> {
   SosStatus _status = const SosStatus.idle();
-  final List<IncomingSos> _incoming = [];
+
+  // Stored so it can be cancelled in dispose() — prevents memory leaks and
+  // duplicate setState calls if the widget is somehow recreated.
+  StreamSubscription<SosStatus>? _statusSub;
+
+  // NOTE: incoming SOS alerts are NO LONGER stored here.
+  // They live in incomingSosProvider (StateNotifierProvider) so alerts
+  // received while this tab is not open are never lost.
+  // See: lib/providers/sos_service_provider.dart → IncomingSosNotifier.
 
   @override
   void initState() {
     super.initState();
-    _subscribeStreams();
+    // TWO-PART subscription strategy (avoids fireImmediately which is not
+    // universally supported across Riverpod 2.x patch versions):
+    //
+    // Part 1 — handled here (initState + addPostFrameCallback):
+    //   Covers the case where sosServiceProvider is ALREADY resolved when
+    //   the screen first builds. addPostFrameCallback fires after the first
+    //   frame, at which point ref.read gives the current value. If the service
+    //   is already AsyncData we subscribe immediately.
+    //
+    // Part 2 — handled in build() via ref.listen (no fireImmediately):
+    //   Covers the case where the service resolves AFTER the first build
+    //   (still loading) or is recreated after logout/login. ref.listen fires
+    //   on every provider value change, so both transitions are caught.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _subscribeToStatusStream(ref.read(sosServiceProvider));
+    });
   }
 
-  void _subscribeStreams() {
-    // We read the provider here imperatively because initState cannot use
-    // ref.watch. The provider itself is watched in build() for rebuild on
-    // service recreation (e.g. after logout/login).
-    final sosAsync = ref.read(sosServiceProvider);
+  @override
+  void dispose() {
+    _statusSub?.cancel();
+    super.dispose();
+  }
+
+  /// Subscribe to [sosAsync]'s status stream if it is resolved.
+  /// Cancels any existing subscription first (idempotent, safe to call
+  /// multiple times — e.g. from both initState and ref.listen).
+  void _subscribeToStatusStream(AsyncValue<SosService> sosAsync) {
     sosAsync.whenData((svc) {
-      svc.sosStatusStream.listen((s) {
+      _statusSub?.cancel();
+      _statusSub = svc.sosStatusStream.listen((s) {
         if (mounted) setState(() => _status = s);
-      });
-      svc.incomingSosStream.listen((inc) {
-        if (mounted) {
-          setState(() {
-            _incoming.insert(0, inc);
-            // Keep last 20 alerts in UI to avoid unbounded list
-            if (_incoming.length > 20) _incoming.removeLast();
-          });
-        }
       });
     });
   }
@@ -88,6 +114,19 @@ class _SosScreenState extends ConsumerState<SosScreen> {
   Widget build(BuildContext context) {
     // Watch so the screen rebuilds if the service is recreated.
     final sosAsync = ref.watch(sosServiceProvider);
+
+    // Part 2 of the two-part subscription strategy (see initState for Part 1).
+    // Fires when sosServiceProvider transitions from loading → data, or when
+    // the service is recreated after logout/login.
+    // Does NOT need fireImmediately — Part 1 (initState) covers the case where
+    // the service is already resolved at first build.
+    ref.listen<AsyncValue<SosService>>(
+      sosServiceProvider,
+      (_, next) => _subscribeToStatusStream(next),
+    );
+
+    // Incoming alerts from the provider — persists across tab switches.
+    final incoming = ref.watch(incomingSosProvider);
 
     final isActive = _status.type != SosStatusType.idle;
     final isGpsWarning = _status.type == SosStatusType.gpsWarning;
@@ -129,10 +168,10 @@ class _SosScreenState extends ConsumerState<SosScreen> {
                   ),
 
                   // ── Incoming alerts ────────────────────────────────────────
-                  if (_incoming.isNotEmpty)
+                  if (incoming.isNotEmpty)
                     Expanded(
                       flex: 4,
-                      child: _IncomingAlertList(alerts: _incoming),
+                      child: _IncomingAlertList(alerts: incoming),
                     )
                   else
                     const Expanded(
@@ -342,9 +381,38 @@ class _IncomingAlertList extends StatelessWidget {
   }
 }
 
-class _IncomingAlertCard extends StatelessWidget {
+// Converted to StatefulWidget so the Firestore name lookup runs once per card
+// (same pattern as _ProofTile and _MessageBubble). Avoids refiring on rebuild.
+class _IncomingAlertCard extends StatefulWidget {
   const _IncomingAlertCard({required this.alert});
   final IncomingSos alert;
+
+  @override
+  State<_IncomingAlertCard> createState() => _IncomingAlertCardState();
+}
+
+class _IncomingAlertCardState extends State<_IncomingAlertCard> {
+  late final Future<String> _nameFuture;
+
+  @override
+  void initState() {
+    super.initState();
+    _nameFuture = _fetchSenderName(widget.alert.senderUid);
+  }
+
+  Future<String> _fetchSenderName(String uid) async {
+    if (uid.isEmpty) return 'Unknown';
+    try {
+      final doc = await FirebaseFirestore.instance
+          .collection(AppConstants.fsUsers)
+          .doc(uid)
+          .get();
+      final name = (doc.data()?['name'] as String?)?.trim() ?? '';
+      return name.isNotEmpty ? name : _shortUid(uid);
+    } catch (_) {
+      return _shortUid(uid);
+    }
+  }
 
   String _shortUid(String uid) =>
       uid.length > 8 ? '${uid.substring(0, 8)}…' : uid;
@@ -354,7 +422,8 @@ class _IncomingAlertCard extends StatelessWidget {
     return '${pad(dt.hour)}:${pad(dt.minute)}:${pad(dt.second)}';
   }
 
-  bool get _hasLocation => alert.latitude != 0.0 || alert.longitude != 0.0;
+  bool get _hasLocation =>
+      widget.alert.latitude != 0.0 || widget.alert.longitude != 0.0;
 
   @override
   Widget build(BuildContext context) {
@@ -387,16 +456,24 @@ class _IncomingAlertCard extends StatelessWidget {
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    Text(
-                      'SOS from ${_shortUid(alert.senderUid)}',
-                      style: const TextStyle(
-                        color: _kTextPrimary,
-                        fontWeight: FontWeight.w600,
-                        fontSize: 13,
-                      ),
+                    // Name resolved from Firestore; falls back to short UID
+                    FutureBuilder<String>(
+                      future: _nameFuture,
+                      builder: (context, snapshot) {
+                        final name = snapshot.data ??
+                            _shortUid(widget.alert.senderUid);
+                        return Text(
+                          'SOS from $name',
+                          style: const TextStyle(
+                            color: _kTextPrimary,
+                            fontWeight: FontWeight.w600,
+                            fontSize: 13,
+                          ),
+                        );
+                      },
                     ),
                     Text(
-                      _formatTime(alert.timestamp),
+                      _formatTime(widget.alert.timestamp),
                       style: const TextStyle(
                         color: _kTextSecondary,
                         fontSize: 11,
@@ -407,8 +484,8 @@ class _IncomingAlertCard extends StatelessWidget {
                 const SizedBox(height: 4),
                 if (_hasLocation)
                   Text(
-                    '📍 ${alert.latitude.toStringAsFixed(5)}, '
-                    '${alert.longitude.toStringAsFixed(5)}',
+                    '📍 ${widget.alert.latitude.toStringAsFixed(5)}, '
+                    '${widget.alert.longitude.toStringAsFixed(5)}',
                     style: const TextStyle(
                       color: _kTextSecondary,
                       fontSize: 12,

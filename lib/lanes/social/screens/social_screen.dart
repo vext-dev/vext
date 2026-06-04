@@ -21,9 +21,11 @@
 //
 // ──────────────────────────────────────────────────────────────────────────────
 
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../../core/app_constants.dart';
 import '../../../core/app_theme.dart';
 import '../../../providers/providers.dart';
 import '../../../services/drift_service.dart';
@@ -232,8 +234,12 @@ class _MeshStatusChip extends StatelessWidget {
 }
 
 // ── Message bubble ────────────────────────────────────────────────────────────
+//
+// Converted to StatefulWidget so the Firestore name lookup future is created
+// once in initState and never re-fired on rebuild (avoids flicker on scroll).
+// Only incoming messages need a lookup — own messages never show a sender label.
 
-class _MessageBubble extends StatelessWidget {
+class _MessageBubble extends StatefulWidget {
   const _MessageBubble({
     required this.message,
     required this.isOwn,
@@ -241,6 +247,38 @@ class _MessageBubble extends StatelessWidget {
 
   final MessageRecord message;
   final bool isOwn;
+
+  @override
+  State<_MessageBubble> createState() => _MessageBubbleState();
+}
+
+class _MessageBubbleState extends State<_MessageBubble> {
+  // Null for outgoing messages (no lookup needed).
+  Future<String>? _nameFuture;
+
+  @override
+  void initState() {
+    super.initState();
+    if (!widget.isOwn) {
+      _nameFuture = _fetchSenderName(widget.message.senderUid);
+    }
+  }
+
+  /// Reads users/{uid}.name from Firestore.
+  /// Falls back to first-8 chars of UID on any error.
+  Future<String> _fetchSenderName(String uid) async {
+    if (uid.isEmpty) return 'Unknown';
+    try {
+      final doc = await FirebaseFirestore.instance
+          .collection(AppConstants.fsUsers)
+          .doc(uid)
+          .get();
+      final name = (doc.data()?['name'] as String?)?.trim() ?? '';
+      return name.isNotEmpty ? name : _shortUid(uid);
+    } catch (_) {
+      return _shortUid(uid);
+    }
+  }
 
   String _shortUid(String uid) =>
       uid.length > 8 ? uid.substring(0, 8) : uid;
@@ -255,7 +293,7 @@ class _MessageBubble extends StatelessWidget {
     return Padding(
       padding: const EdgeInsets.only(bottom: 8),
       child: Align(
-        alignment: isOwn ? Alignment.centerRight : Alignment.centerLeft,
+        alignment: widget.isOwn ? Alignment.centerRight : Alignment.centerLeft,
         child: ConstrainedBox(
           constraints: BoxConstraints(
             maxWidth: MediaQuery.of(context).size.width * 0.75,
@@ -263,42 +301,52 @@ class _MessageBubble extends StatelessWidget {
           child: Container(
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
             decoration: BoxDecoration(
-              color: isOwn ? _kBubbleOut : _kBubbleIn,
+              color: widget.isOwn ? _kBubbleOut : _kBubbleIn,
               borderRadius: BorderRadius.only(
                 topLeft: const Radius.circular(16),
                 topRight: const Radius.circular(16),
-                bottomLeft: Radius.circular(isOwn ? 16 : 4),
-                bottomRight: Radius.circular(isOwn ? 4 : 16),
+                bottomLeft: Radius.circular(widget.isOwn ? 16 : 4),
+                bottomRight: Radius.circular(widget.isOwn ? 4 : 16),
               ),
               border: Border.all(
-                color: isOwn
+                color: widget.isOwn
                     ? AppTheme.primaryColor.withValues(alpha: 0.25)
                     : _kBorder,
                 width: 1,
               ),
             ),
             child: Column(
-              crossAxisAlignment:
-                  isOwn ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+              crossAxisAlignment: widget.isOwn
+                  ? CrossAxisAlignment.end
+                  : CrossAxisAlignment.start,
               children: [
                 // Sender label — only for incoming messages
-                if (!isOwn)
+                if (!widget.isOwn)
                   Padding(
                     padding: const EdgeInsets.only(bottom: 4),
-                    child: Text(
-                      _shortUid(message.senderUid),
-                      style: const TextStyle(
-                        color: AppTheme.primaryColor,
-                        fontSize: 11,
-                        fontWeight: FontWeight.w600,
-                        letterSpacing: 0.5,
-                      ),
+                    child: FutureBuilder<String>(
+                      future: _nameFuture,
+                      builder: (context, snapshot) {
+                        // While resolving: show short UID as placeholder.
+                        // On resolve: show the real name (or UID fallback).
+                        final label = snapshot.data ??
+                            _shortUid(widget.message.senderUid);
+                        return Text(
+                          label,
+                          style: const TextStyle(
+                            color: AppTheme.primaryColor,
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600,
+                            letterSpacing: 0.5,
+                          ),
+                        );
+                      },
                     ),
                   ),
 
                 // Message content
                 Text(
-                  message.contentEncrypted,
+                  widget.message.contentEncrypted,
                   style: const TextStyle(
                     color: _kTextPrimary,
                     fontSize: 14,
@@ -310,7 +358,7 @@ class _MessageBubble extends StatelessWidget {
 
                 // Timestamp
                 Text(
-                  _formatTime(message.timestamp),
+                  _formatTime(widget.message.timestamp),
                   style: const TextStyle(
                     color: _kTextSecondary,
                     fontSize: 10,

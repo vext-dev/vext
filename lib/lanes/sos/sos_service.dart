@@ -109,15 +109,25 @@ class SosService {
     required AppDatabase db,
     required FirebaseSyncEngine syncEngine,
     required String currentUserUid,
+    Future<void> Function()? onSosActivated,
+    Future<void> Function()? onSosCancelled,
   })  : _mesh = mesh,
         _db = db,
         _syncEngine = syncEngine,
-        _currentUserUid = currentUserUid;
+        _currentUserUid = currentUserUid,
+        _onSosActivated = onSosActivated,
+        _onSosCancelled = onSosCancelled;
 
   final MeshService _mesh;
   final AppDatabase _db;
   final FirebaseSyncEngine _syncEngine;
   final String _currentUserUid;
+
+  // ── Duty-cycle callbacks (injected by provider — avoids Riverpod ref in service) ─
+  // onSosActivated: called when SOS is triggered → boosts BLE to 100ms/100ms scan.
+  // onSosCancelled: called when SOS is cancelled → reverts BLE to session mode.
+  final Future<void> Function()? _onSosActivated;
+  final Future<void> Function()? _onSosCancelled;
 
   // ── Active SOS state ───────────────────────────────────────────────────────
   String? _activeSosId;
@@ -220,6 +230,11 @@ class SosService {
     // ── Sync to Firestore — triggers handleSOSAlert Cloud Function ──────────
     _syncEngine.syncNow().ignore();
 
+    // ── Boost BLE to SOS duty cycle (100ms/100ms) ───────────────────────────
+    // Critical: mesh relay speed is 5x faster in SOS mode. Called via injected
+    // callback so SosService has no dependency on Riverpod or BleStateNotifier.
+    _onSosActivated?.call().ignore();
+
     // ── Re-broadcast timer (originating device only) ────────────────────────
     _rebroadcastTimer = Timer.periodic(
       Duration(milliseconds: AppConstants.sosRebroadcastIntervalMs),
@@ -243,6 +258,8 @@ class SosService {
     _rebroadcastTimer = null;
     _activeSosId = null;
     _activeSosPacket = null;
+    // Revert BLE from SOS mode back to session duty cycle.
+    _onSosCancelled?.call().ignore();
     _statusController.add(const SosStatus.idle());
   }
 

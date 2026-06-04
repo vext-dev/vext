@@ -29,9 +29,14 @@ class _AttendanceScreenState extends ConsumerState<AttendanceScreen> {
   void initState() {
     super.initState();
     // Elevate to session duty cycle (50% scan) while on this screen.
-    // Reverts to idle when navigating away (lifecycle handled by BleStateNotifier).
+    // This call is a safety-net defence-in-depth alongside the shell-level
+    // duty cycle management in AppShellScreen._applyDutyCycleForTab().
+    // The shell call fires first (on tab tap); this call fires after the first
+    // frame in case the screen is built before the shell's tab tap fires
+    // (e.g. initial app load where initState runs before _onTabTap is called).
+    // Duty cycle revert on navigation away is handled by the shell — not here.
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      ref.read(bleStateProvider.notifier).startSession();
+      if (mounted) ref.read(bleStateProvider.notifier).startSession().ignore();
     });
   }
 

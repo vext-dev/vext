@@ -95,16 +95,27 @@
             </intent-filter>
         </activity>
 
-        <!-- ── NOTE: Plugin-managed services are intentionally NOT declared here.
-             flutter_background_service registers BackgroundService in its own
-             AndroidManifest (android:exported="true"). firebase_messaging registers
-             FirebaseMessagingService in its own manifest. Re-declaring either here
-             causes a manifest merger conflict on android:exported.
-             ──
-             When the VEXT BLE mesh foreground service is written in Milestone 2,
-             add a <service> entry for OUR class (e.g. VextMeshService), NOT
-             for plugin-owned classes.
+        <!-- ── flutter_background_service foreground type override ──────────────
+             The plugin declares BackgroundService in its own AndroidManifest
+             without a foregroundServiceType attribute. On Android 14 (API 34+)
+             with targetSdk 34+, calling startForeground() without a declared
+             type throws a ForegroundServiceTypeNotAllowedException and crashes
+             the app on screen-off.
+
+             tools:node="merge" merges our attributes onto the plugin's existing
+             <service> declaration instead of re-declaring it (which would cause
+             a "duplicate service" manifest merger conflict on android:exported).
+
+             connectedDevice covers BLE GATT connections, HFP, and A2DP — the
+             correct type for a BLE mesh foreground service.
+
+             FOREGROUND_SERVICE_CONNECTED_DEVICE permission is already declared
+             above in the <uses-permission> block.
              ──────────────────────────────────────────────────────────────── -->
+        <service
+            android:name="id.flutter.flutter_background_service.BackgroundService"
+            android:foregroundServiceType="connectedDevice"
+            tools:node="merge" />
 
         <!-- Flutter tool meta-data — do not delete -->
         <meta-data

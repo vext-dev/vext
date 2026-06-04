@@ -51,6 +51,7 @@ import 'dart:async';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:drift/drift.dart' show Value;
+import 'package:flutter/foundation.dart';
 import 'package:uuid/uuid.dart';
 
 import '../../core/app_constants.dart';
@@ -215,8 +216,33 @@ class AttendanceService {
       currentHmacToken: hmacToken,
     );
 
-    // Write session doc to Firestore (best-effort — may be offline).
-    _writeSessionToFirestore(_activeSession!);
+    // Write session doc to Firestore and wait for it to reach the server
+    // BEFORE returning. This is not optional:
+    //
+    // watchFirestoreProofs() opens a Firestore stream on:
+    //   attendance/{sessionId}/proofs/{studentUid}
+    //
+    // The security rule for that stream is:
+    //   allow read: if isTeacher() &&
+    //     get(/databases/.../sessions/{sessionId}).data.teacherUid == request.auth.uid;
+    //
+    // Firestore security rules ALWAYS evaluate get() against the server —
+    // never the local offline cache. If this method returned before the session
+    // doc reached the server, the rule's get() would see a missing document,
+    // .data.teacherUid would be null, the rule would fail, and the teacher's
+    // proof stream would immediately error with permission-denied.
+    //
+    // 10-second timeout: if the device is offline, we proceed anyway. The
+    // session is still broadcasting over BLE; Firestore will sync when the
+    // device reconnects. The proof stream will be empty or in error until then.
+    await _writeSessionToFirestore(_activeSession!);
+    await _firestore.waitForPendingWrites().timeout(
+      const Duration(seconds: 10),
+      onTimeout: () {
+        debugPrint('[Attendance] waitForPendingWrites timed out — '
+            'device may be offline; watchFirestoreProofs may error until sync');
+      },
+    );
 
     // Broadcast immediately, then on a timer.
     await _broadcastAttendancePacket();
@@ -253,7 +279,9 @@ class AttendanceService {
 
     if (_activeSession != null) {
       _activeSession!.isActive = false;
-      _writeSessionToFirestore(_activeSession!); // mark closed in Firestore
+      // Fire-and-forget: marking a session inactive has no security implications.
+      // No waitForPendingWrites needed — no Firestore rule reads this value.
+      _writeSessionToFirestore(_activeSession!).ignore();
     }
 
     _activeSession = null;
@@ -442,11 +470,16 @@ class AttendanceService {
 
   // ── Private — Firestore ────────────────────────────────────────────────────
 
-  void _writeSessionToFirestore(AttendanceSession session) {
-    _firestore
+  /// Write (or update) the session document in Firestore.
+  ///
+  /// Returns a Future so callers can await it. [startSession] awaits this
+  /// plus [waitForPendingWrites] to guarantee the session doc exists on the
+  /// Firestore server before [watchFirestoreProofs] is opened. [stopSession]
+  /// does NOT await it — marking a session inactive is not security-critical.
+  Future<void> _writeSessionToFirestore(AttendanceSession session) {
+    return _firestore
         .collection(AppConstants.fsSessions)
         .doc(session.id)
-        .set(session.toFirestore(), SetOptions(merge: true))
-        .ignore(); // offline-first: no await, sync engine will retry
+        .set(session.toFirestore(), SetOptions(merge: true));
   }
 }

@@ -70,13 +70,63 @@ class _AppShellScreenState extends ConsumerState<AppShellScreen> {
     return 0; // default to Attendance
   }
 
+  @override
+  void initState() {
+    super.initState();
+    // App always starts on Attendance tab after auth.
+    // Set session duty cycle immediately so the student's phone is ready to
+    // receive teacher attendance broadcasts from the first second.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _applyDutyCycleForTab(0);
+    });
+  }
+
   void _onTabTap(BuildContext context, int index) {
     final target = _tabs[index].route;
     final current = GoRouterState.of(context).uri.toString();
 
-    // Avoid redundant navigation to the same route
+    // Avoid redundant navigation to the same route.
     if (!current.startsWith(target)) {
       context.go(target);
+    }
+
+    // Always update duty cycle on tab tap — idempotent and cheap.
+    _applyDutyCycleForTab(index);
+  }
+
+  /// Set the BLE scan duty cycle appropriate for the given tab index.
+  ///
+  /// Tabs 0 (Attendance), 1 (Social), 2 (SOS) are active communication lanes.
+  /// They need session duty cycle (500ms/500ms, ~50% scan overlap) for reliable
+  /// BLE packet exchange.
+  ///
+  /// Tab 3 (Profile) is passive. Revert to idle (1s/30s, ~3%) to conserve
+  /// battery — no BLE mesh communication happens on this tab.
+  ///
+  /// SAFETY RULE: Never downgrade from SOS mode. If the user triggered an SOS
+  /// and then taps Profile, the emergency duty cycle must be preserved. Only
+  /// downgrade from activeSession → idle, never from sosMode.
+  ///
+  /// This is called both on tab tap AND on shell initState so the duty cycle
+  /// is correct from the first frame, regardless of which screen triggers BLE.
+  void _applyDutyCycleForTab(int index) {
+    final bleState = ref.read(bleStateProvider);
+    final notifier = ref.read(bleStateProvider.notifier);
+
+    // Index 0 = Attendance, 1 = Social, 2 = SOS — all need active scanning.
+    // Index 3 = Profile — passive.
+    final isActiveLane = index < 3;
+
+    if (isActiveLane) {
+      // Boost if currently in idle. Never downgrade from activeSession or sosMode.
+      if (bleState.mode == MeshMode.idle) {
+        notifier.startSession().ignore();
+      }
+    } else {
+      // Profile tab — revert from session to idle, but NEVER from sosMode.
+      if (bleState.mode == MeshMode.activeSession) {
+        notifier.startIdle().ignore();
+      }
     }
   }
 

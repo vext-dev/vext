@@ -112,6 +112,11 @@ class BleTransportLayer {
   /// device remoteId → BluetoothDevice (for GATT client writes)
   final Map<String, BluetoothDevice> _peerDevices = {};
 
+  /// device remoteId → time of last scan result — used for stale-peer eviction.
+  /// Peers not seen for 60 s are removed from _peerRssi and _peerDevices so
+  /// broadcastPacket() does not try to GATT-connect to out-of-range devices.
+  final Map<String, DateTime> _peerLastSeen = {};
+
   // ── Callbacks ─────────────────────────────────────────────────────────────
 
   PacketReceivedCallback? onPacketReceived;
@@ -128,6 +133,7 @@ class BleTransportLayer {
   StreamSubscription<BluetoothAdapterState>? _adapterSub;
   StreamSubscription<dynamic>? _gattPacketSub;
   Timer? _dutyCycleTimer;
+  Timer? _evictionTimer;
 
   // ── Public API ─────────────────────────────────────────────────────────────
 
@@ -183,6 +189,12 @@ class BleTransportLayer {
 
     await _startScanOnce();
     _scheduleDutyCycle();
+
+    // Evict peers not seen for 60 s every 30 s to keep broadcastPacket() lean.
+    _evictionTimer ??= Timer.periodic(
+      const Duration(seconds: 30),
+      (_) => _evictStalePeers(),
+    );
   }
 
   /// Stop all scanning, advertising, and GATT operations.
@@ -191,6 +203,9 @@ class BleTransportLayer {
 
     _dutyCycleTimer?.cancel();
     _dutyCycleTimer = null;
+
+    _evictionTimer?.cancel();
+    _evictionTimer = null;
 
     await _scanSub?.cancel();
     _scanSub = null;
@@ -215,6 +230,7 @@ class BleTransportLayer {
 
     _peerRssi.clear();
     _peerDevices.clear();
+    _peerLastSeen.clear();
     onPeerCountChanged?.call(0);
   }
 
@@ -253,59 +269,73 @@ class BleTransportLayer {
 
   // ── GATT client — send packets to peers ───────────────────────────────────
 
-  /// Send [packetBytes] to a single peer via GATT write.
+  /// Send [packetBytes] to a single peer via GATT write, with up to 3 attempts.
   ///
   /// Connect → discover services → find VEXT write characteristic → write → disconnect.
-  /// All errors are silently ignored — a failed write means the peer moved out of
-  /// range; MeshService / TTL policy handles retries.
+  /// Retries up to 3 times with 100ms / 200ms backoff between attempts.
+  /// After all attempts fail the error is silently swallowed — the peer likely
+  /// moved out of range; MeshService TTL policy handles higher-level retries.
   Future<void> sendPacketToPeer(
     BluetoothDevice device,
     List<int> packetBytes,
   ) async {
-    try {
-      await device.connect(
-        timeout: const Duration(seconds: 5),
-        autoConnect: false,
-      );
-
-      final services = await device.discoverServices();
-
-      BluetoothService? vextService;
-      for (final s in services) {
-        if (s.serviceUuid == _vextServiceUuid) {
-          vextService = s;
-          break;
-        }
-      }
-      if (vextService == null) {
-        await device.disconnect();
-        return;
-      }
-
-      BluetoothCharacteristic? writeChar;
-      for (final c in vextService.characteristics) {
-        if (c.characteristicUuid == _vextWriteCharUuid) {
-          writeChar = c;
-          break;
-        }
-      }
-      if (writeChar == null) {
-        await device.disconnect();
-        return;
-      }
-
-      await writeChar.write(packetBytes, withoutResponse: true);
-      await device.disconnect();
-    } catch (_) {
+    for (int attempt = 0; attempt < 3; attempt++) {
       try {
+        await device.connect(
+          timeout: const Duration(seconds: 5),
+          autoConnect: false,
+        );
+
+        final services = await device.discoverServices();
+
+        BluetoothService? vextService;
+        for (final s in services) {
+          if (s.serviceUuid == _vextServiceUuid) {
+            vextService = s;
+            break;
+          }
+        }
+        if (vextService == null) {
+          await device.disconnect();
+          return; // Device is VEXT but service disappeared — don't retry.
+        }
+
+        BluetoothCharacteristic? writeChar;
+        for (final c in vextService.characteristics) {
+          if (c.characteristicUuid == _vextWriteCharUuid) {
+            writeChar = c;
+            break;
+          }
+        }
+        if (writeChar == null) {
+          await device.disconnect();
+          return; // Characteristic gone — don't retry.
+        }
+
+        await writeChar.write(packetBytes, withoutResponse: true);
         await device.disconnect();
-      } catch (_) {}
+        return; // ── Success ──
+      } catch (_) {
+        try { await device.disconnect(); } catch (_) {}
+        if (attempt < 2) {
+          // Backoff: 100ms after attempt 0, 200ms after attempt 1.
+          await Future<void>.delayed(Duration(milliseconds: 100 * (attempt + 1)));
+        }
+      }
     }
   }
 
-  /// Broadcast [packetBytes] to ALL currently known peers via GATT concurrently.
+  /// Broadcast [packetBytes] to currently known peers via GATT concurrently.
+  ///
+  /// Capped at 5 concurrent GATT connections. Android supports up to 7
+  /// simultaneous GATT connections on most devices; leaving 2 slots free
+  /// avoids connection failures when the peer count is large.
+  /// Peers are already fresher than 60 s (eviction timer) so stale devices
+  /// are never included here.
   void broadcastPacket(List<int> packetBytes) {
-    final devices = List<BluetoothDevice>.from(_peerDevices.values);
+    final devices = List<BluetoothDevice>.from(_peerDevices.values)
+        .take(5)
+        .toList();
     for (final device in devices) {
       sendPacketToPeer(device, packetBytes).ignore();
     }
@@ -421,6 +451,7 @@ class BleTransportLayer {
       final deviceId = result.device.remoteId.str;
       _peerRssi[deviceId] = rssi;
       _peerDevices[deviceId] = result.device; // retained for GATT client writes
+      _peerLastSeen[deviceId] = DateTime.now(); // for stale-peer eviction
 
       // If the peer included 18-byte MeshPacket header data in the scan response
       // manufacturer data, parse it. This is optional — full packets arrive
@@ -531,6 +562,32 @@ class BleTransportLayer {
     }
   }
 
+  // ── Private — Stale peer eviction ────────────────────────────────────────
+
+  /// Remove peers not seen in the last 60 seconds.
+  ///
+  /// Called every 30 s by [_evictionTimer]. Prevents [broadcastPacket] from
+  /// trying to GATT-connect to devices that have walked out of range, which
+  /// ties up GATT slots for the full 5-second connect timeout.
+  void _evictStalePeers() {
+    final cutoff = DateTime.now().subtract(const Duration(seconds: 60));
+    final stale = _peerLastSeen.entries
+        .where((e) => e.value.isBefore(cutoff))
+        .map((e) => e.key)
+        .toList();
+
+    if (stale.isEmpty) return;
+
+    for (final id in stale) {
+      _peerRssi.remove(id);
+      _peerDevices.remove(id);
+      _peerLastSeen.remove(id);
+    }
+    onPeerCountChanged?.call(_peerRssi.length);
+    debugPrint('[BLE] evicted ${stale.length} stale peer(s) — '
+        '${_peerRssi.length} peer(s) remain');
+  }
+
   // ── Private — Adapter state ───────────────────────────────────────────────
 
   void _onAdapterState(BluetoothAdapterState state) {
@@ -539,6 +596,7 @@ class BleTransportLayer {
     } else if (state != BluetoothAdapterState.on) {
       _peerRssi.clear();
       _peerDevices.clear();
+      _peerLastSeen.clear();
       onPeerCountChanged?.call(0);
     }
   }
