@@ -15,7 +15,9 @@ android {
     namespace = "com.example.vext"
 
     // ── SDK versions ────────────────────────────────────────────────────────
-    // compileSdk must be >= 34 to use FOREGROUND_SERVICE_CONNECTED_DEVICE
+    // compileSdk 36 required by flutter_blue_plus_android and geolocator_android.
+    // Android SDK versions are backward compatible — compiling against 36 does
+    // not change the minimum supported device (that is controlled by minSdk).
     compileSdk = 36
 
     ndkVersion = flutter.ndkVersion
@@ -36,13 +38,15 @@ android {
         applicationId = "com.example.vext"
 
         // minSdk 21 = Android 5.0 Lollipop (minimum for BLE + foreground service).
-        // Hardcoded — do NOT use flutter.minSdkVersion here. Flutter's default
+        // Hardcoded to 21 — do NOT use flutter.minSdkVersion here. Flutter's default
         // resolves to 21 in 3.x but could regress in future SDK updates, silently
         // breaking BLE GATT and the foreground service on older devices.
-        minSdk = flutter.minSdkVersion
+        minSdk = 21
 
-        // targetSdk 34 = Android 14 (required for foreground service type declarations).
-        targetSdk = 36
+        // targetSdk 35 = Android 15 (foreground service type declarations fully supported).
+        // Kept at 35 intentionally — targetSdk 36 (Android 16) triggers additional
+        // background restrictions not yet handled in this milestone.
+        targetSdk = 35
 
         versionCode = flutter.versionCode
         versionName = flutter.versionName

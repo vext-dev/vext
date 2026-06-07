@@ -6,12 +6,20 @@
 //   3. Watch a live list of student proofs as they arrive.
 //   4. Stop the session when done.
 //
-// The screen accesses AttendanceService via attendanceServiceProvider.
-// Proof list is driven by a Firestore snapshots() stream (watchFirestoreProofs)
-// so the teacher sees students the moment their proof is synced to Firestore,
-// regardless of BLE proximity to the teacher's device.
+// Proof source strategy (Fix 4A + 4B):
+//   PRIMARY   — Firestore snapshots() when online. Shows every student whose
+//               proof has synced, regardless of BLE proximity.
+//   FALLBACK  — Local Drift DB watch when Firestore is unavailable (offline,
+//               permission-denied before session doc reaches server). Shows
+//               students whose devices sent an ACK packet via BLE.
+//
+// The _ProofList widget tries Firestore first. On permission-denied or any
+// Firestore error it switches to Drift and retries Firestore every 15 seconds.
+// This means the teacher always sees students — even with no internet.
 //
 // ──────────────────────────────────────────────────────────────────────────────
+
+import 'dart:async';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
@@ -21,7 +29,8 @@ import '../../../core/app_constants.dart';
 import '../../../core/app_theme.dart';
 import '../../../lanes/attendance/attendance_service.dart';
 import '../../../providers/attendance_service_provider.dart';
-// drift_service import removed — _ProofTile now uses Firestore Map data, not Drift AttendanceProof row
+import '../../../providers/database_provider.dart';
+import '../../../services/drift_service.dart';
 
 class TeacherSessionScreen extends ConsumerStatefulWidget {
   const TeacherSessionScreen({super.key});
@@ -302,25 +311,68 @@ class _StatusCard extends StatelessWidget {
   }
 }
 
-// ── Live proof list (Firestore stream) ───────────────────────────────────────
+// ── Live proof list — Firestore primary, Drift fallback (Fix 4A + 4B) ─────────
 //
-// Uses AttendanceService.watchFirestoreProofs() — a real-time Firestore
-// snapshots() listener on attendance/{sessionId}/proofs.
-//
-// Why Firestore and not local Drift DB?
-//   Student proofs are written to the STUDENT'S local Drift DB, then synced
-//   to Firestore by the student's FirebaseSyncEngine. The teacher's local DB
-//   is empty. Watching Firestore ensures the teacher sees all students the
-//   moment their proof is uploaded, regardless of BLE range.
+// Strategy:
+//   • Try Firestore first (shows all students, online + cloud-synced).
+//   • On permission-denied (session doc not yet on server) or any Firestore
+//     error, switch to Drift DB (shows students that sent ACK via BLE).
+//   • Auto-retry Firestore every 15 seconds so it upgrades automatically when
+//     the session doc reaches the server.
+//   • A source badge tells the teacher which feed they are seeing.
 
-class _ProofList extends ConsumerWidget {
+enum _ProofSource { loading, firestore, localBle, error }
+
+class _ProofList extends ConsumerStatefulWidget {
   const _ProofList({required this.sessionId});
 
   final String sessionId;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<_ProofList> createState() => _ProofListState();
+}
+
+class _ProofListState extends ConsumerState<_ProofList> {
+  String? _firestoreError;
+  Timer? _retryTimer;
+  bool _firestoreFailed = false;
+
+  // ── Cached streams ─────────────────────────────────────────────────────────
+  // Bug fix: watchFirestoreProofs() and watchProofsForSession() create a NEW
+  // stream object on every call. If we call them inside build(), StreamBuilder
+  // sees a different stream reference on every rebuild and re-subscribes,
+  // creating and immediately destroying Firestore listeners on each Riverpod
+  // provider update. Caching the streams in initState (and resetting the
+  // Firestore stream on retry) fixes this.
+  //
+  // We use late + nullable pattern so we can reset _firestoreStream when
+  // the retry timer fires (needed to get a fresh subscription after a failure).
+  Stream<List<Map<String, dynamic>>>? _firestoreStream;
+  Stream<List<AttendanceProof>>? _driftStream;
+
+  void _scheduleFirestoreRetry() {
+    _retryTimer?.cancel();
+    _retryTimer = Timer(const Duration(seconds: 15), () {
+      if (!mounted) return;
+      setState(() {
+        _firestoreFailed = false;
+        // Null out the cached stream so we create a fresh subscription
+        // next build — the old one may be in an error state.
+        _firestoreStream = null;
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    _retryTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
     final attendanceAsync = ref.watch(attendanceServiceProvider);
+    final dbAsync = ref.watch(databaseProvider);
 
     return attendanceAsync.when(
       loading: () => const Center(
@@ -328,109 +380,244 @@ class _ProofList extends ConsumerWidget {
       error: (e, _) => Center(
           child: Text('Error: $e',
               style: const TextStyle(color: AppTheme.errorColor))),
-      data: (svc) => StreamBuilder<List<Map<String, dynamic>>>(
-        stream: svc.watchFirestoreProofs(sessionId),
-        builder: (context, snapshot) {
-          if (snapshot.connectionState == ConnectionState.waiting) {
-            return const Center(
-              child: Text(
-                'Connecting to Firestore…',
-                style: TextStyle(color: AppTheme.hintTextColor),
-              ),
-            );
-          }
+      data: (svc) {
+        // ── Firestore path ─────────────────────────────────────────────────
+        if (!_firestoreFailed) {
+          // Initialise stream once (or after a retry reset). Never recreate
+          // it on a plain rebuild — doing so re-subscribes every frame.
+          _firestoreStream ??= svc.watchFirestoreProofs(widget.sessionId);
 
-          if (snapshot.hasError) {
-            return Center(
-              child: Text(
-                'Error: ${snapshot.error}',
-                style: const TextStyle(color: AppTheme.errorColor, fontSize: 12),
-              ),
-            );
-          }
+          return StreamBuilder<List<Map<String, dynamic>>>(
+            stream: _firestoreStream,
+            builder: (context, snapshot) {
+              if (snapshot.hasError) {
+                final err = snapshot.error.toString();
+                final isPermissionDenied = err.contains('permission-denied') ||
+                    err.contains('PERMISSION_DENIED');
 
-          final proofs = snapshot.data ?? [];
+                // Use addPostFrameCallback so we don't call setState inside build().
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  if (!mounted || _firestoreFailed) return; // guard double-fire
+                  setState(() {
+                    _firestoreFailed = true;
+                    _firestoreStream = null; // will be recreated on retry
+                    _firestoreError = isPermissionDenied
+                        ? 'Waiting for cloud sync — showing BLE-only results'
+                        : 'Firestore unavailable — showing BLE-only results';
+                  });
+                  _scheduleFirestoreRetry();
+                });
 
-          if (proofs.isEmpty) {
-            return const Center(
-              child: Text(
-                'No students marked yet.\nMake sure students have the app open.',
-                style:
-                    TextStyle(color: AppTheme.secondaryTextColor, fontSize: 13),
-                textAlign: TextAlign.center,
-              ),
-            );
-          }
+                return const Center(
+                  child: Text(
+                    'Connecting…',
+                    style: TextStyle(color: AppTheme.hintTextColor),
+                  ),
+                );
+              }
 
-          return ListView.separated(
-            itemCount: proofs.length,
-            separatorBuilder: (_, __) => const Divider(
-              height: 1,
-              color: AppTheme.inputBorderColor,
-              indent: 56,
-            ),
-            itemBuilder: (context, index) {
-              return _ProofTile(data: proofs[index]);
+              if (snapshot.connectionState == ConnectionState.waiting) {
+                return const Center(
+                  child: Text(
+                    'Connecting to Firestore…',
+                    style: TextStyle(color: AppTheme.hintTextColor),
+                  ),
+                );
+              }
+
+              final proofs = snapshot.data ?? [];
+              return _buildProofListView(
+                proofs: proofs.map((d) => _NormalisedProof.fromFirestore(d)).toList(),
+                source: _ProofSource.firestore,
+              );
             },
           );
-        },
-      ),
+        }
+
+        // ── Drift fallback path (offline / permission-denied) ──────────────
+        return dbAsync.when(
+          loading: () => const Center(
+              child: CircularProgressIndicator(color: AppTheme.primaryColor)),
+          error: (e, _) => Center(
+              child: Text('DB error: $e',
+                  style: const TextStyle(color: AppTheme.errorColor))),
+          data: (db) {
+            // Cache Drift stream once — same reason as Firestore stream above.
+            _driftStream ??= db.watchProofsForSession(widget.sessionId);
+            return StreamBuilder<List<AttendanceProof>>(
+              stream: _driftStream,
+              builder: (context, snapshot) {
+                final proofs = snapshot.data ?? [];
+                return _buildProofListView(
+                  proofs: proofs.map(_NormalisedProof.fromDrift).toList(),
+                  source: _ProofSource.localBle,
+                );
+              },
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _buildProofListView({
+    required List<_NormalisedProof> proofs,
+    required _ProofSource source,
+  }) {
+    return Column(
+      children: [
+        // ── Source badge ───────────────────────────────────────────────────
+        if (source == _ProofSource.localBle && _firestoreError != null)
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+            color: AppTheme.cardColor,
+            child: Row(
+              children: [
+                const Icon(Icons.bluetooth,
+                    size: 14, color: AppTheme.secondaryTextColor),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    _firestoreError!,
+                    style: const TextStyle(
+                        color: AppTheme.secondaryTextColor, fontSize: 11),
+                  ),
+                ),
+                const SizedBox(width: 6),
+                const Text('Retrying…',
+                    style: TextStyle(
+                        color: AppTheme.hintTextColor, fontSize: 10)),
+              ],
+            ),
+          ),
+        if (source == _ProofSource.firestore)
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+            color: AppTheme.cardColor,
+            child: Row(
+              children: [
+                const Icon(Icons.cloud_done_outlined,
+                    size: 14, color: AppTheme.successColor),
+                const SizedBox(width: 6),
+                const Text(
+                  'Live — cloud + BLE',
+                  style: TextStyle(
+                      color: AppTheme.successColor, fontSize: 11),
+                ),
+              ],
+            ),
+          ),
+
+        // ── Proof list ─────────────────────────────────────────────────────
+        Expanded(
+          child: proofs.isEmpty
+              ? Center(
+                  child: Text(
+                    source == _ProofSource.localBle
+                        ? 'No students marked yet.\nStudents in BLE range will appear here.'
+                        : 'No students marked yet.\nMake sure students have the app open.',
+                    style: const TextStyle(
+                        color: AppTheme.secondaryTextColor, fontSize: 13),
+                    textAlign: TextAlign.center,
+                  ),
+                )
+              : ListView.separated(
+                  itemCount: proofs.length,
+                  separatorBuilder: (_, __) => const Divider(
+                    height: 1,
+                    color: AppTheme.inputBorderColor,
+                    indent: 56,
+                  ),
+                  itemBuilder: (context, index) {
+                    return _ProofTile(proof: proofs[index]);
+                  },
+                ),
+        ),
+      ],
     );
   }
 }
 
+// ── Normalised proof — unifies Firestore Map and Drift AttendanceProof ────────
+
+class _NormalisedProof {
+  const _NormalisedProof({
+    required this.studentUid,
+    required this.rssi,
+    required this.timestamp,
+    this.isLocal = false,
+  });
+
+  factory _NormalisedProof.fromFirestore(Map<String, dynamic> data) {
+    DateTime ts;
+    try {
+      ts = (data['timestamp'] as dynamic).toDate() as DateTime;
+    } catch (_) {
+      ts = DateTime.now();
+    }
+    return _NormalisedProof(
+      studentUid: data['studentUid'] as String? ?? '—',
+      rssi: data['rssi'] as int? ?? 0,
+      timestamp: ts,
+    );
+  }
+
+  factory _NormalisedProof.fromDrift(AttendanceProof proof) {
+    return _NormalisedProof(
+      studentUid: proof.studentUid,
+      rssi: proof.rssi,
+      timestamp: proof.timestamp,
+      isLocal: true,
+    );
+  }
+
+  final String studentUid;
+  final int rssi;
+  final DateTime timestamp;
+  /// True when the proof came from the local Drift DB (BLE ACK path).
+  final bool isLocal;
+}
+
 // ── ProofTile — shows student name resolved from Firestore users collection ──────
 //
-// Converted to StatefulWidget so the Future is created once in initState and
-// never recreated on rebuild (avoids name flicker on list scroll or parent rebuild).
-//
-// Name lookup: Firestore users/{studentUid} → 'name' field.
-// Falls back to truncated UID if: network error, document missing, name empty.
-// The avatar shows the student's initials once the name resolves.
+// Accepts a _NormalisedProof (unified from Firestore or Drift).
+// Name lookup: Firestore users/{studentUid} → 'name' field, UID fallback on error.
+// Future is stored in initState to prevent name flicker on rebuild/scroll.
 
 class _ProofTile extends StatefulWidget {
-  const _ProofTile({required this.data});
+  const _ProofTile({required this.proof});
 
-  /// Firestore document data — fields written by FirebaseSyncEngine:
-  ///   studentUid (String), rssi (int), timestamp (Timestamp), syncedAt (Timestamp)
-  final Map<String, dynamic> data;
+  final _NormalisedProof proof;
 
   @override
   State<_ProofTile> createState() => _ProofTileState();
 }
 
 class _ProofTileState extends State<_ProofTile> {
-  // Future is stored as a field so it is only created once per tile lifetime,
-  // not on every rebuild. This prevents the "loading flash" on list scroll.
   late final Future<String> _nameFuture;
 
   @override
   void initState() {
     super.initState();
-    final uid = widget.data['studentUid'] as String? ?? '';
-    _nameFuture = _fetchStudentName(uid);
+    _nameFuture = _fetchStudentName(widget.proof.studentUid);
   }
 
-  /// One-time Firestore read: users/{uid} → name field.
-  /// Returns the display name, or the UID as fallback on any failure.
   Future<String> _fetchStudentName(String uid) async {
-    if (uid.isEmpty) return '—';
+    if (uid.isEmpty || uid == '—') return '—';
     try {
       final doc = await FirebaseFirestore.instance
           .collection(AppConstants.fsUsers)
           .doc(uid)
           .get();
       final name = (doc.data()?['name'] as String?)?.trim() ?? '';
-      // Return name if non-empty, otherwise fall back to uid.
       return name.isNotEmpty ? name : uid;
     } catch (_) {
-      // Network error or permission denied — show uid as fallback.
-      return uid;
+      return uid; // offline or permission error — show UID
     }
   }
 
-  /// Extracts up to 2 initials from a display name.
-  /// "John Doe" → "JD", "Jane" → "J", "" → "?" (fallback).
   String _initials(String name) {
     final parts = name.trim().split(RegExp(r'\s+'));
     if (parts.isEmpty || parts.first.isEmpty) return '?';
@@ -438,17 +625,9 @@ class _ProofTileState extends State<_ProofTile> {
     return '${parts.first[0]}${parts.last[0]}'.toUpperCase();
   }
 
-  /// Whether [value] looks like a raw Firebase UID (no spaces, 28 chars).
-  bool _isUid(String value) =>
-      value.length >= 20 && !value.contains(' ');
+  bool _isUid(String value) => value.length >= 20 && !value.contains(' ');
 
-  String _formatTime(dynamic rawTs) {
-    DateTime dt;
-    try {
-      dt = (rawTs as dynamic).toDate() as DateTime;
-    } catch (_) {
-      dt = DateTime.now();
-    }
+  String _formatTime(DateTime dt) {
     final h = dt.hour.toString().padLeft(2, '0');
     final m = dt.minute.toString().padLeft(2, '0');
     final s = dt.second.toString().padLeft(2, '0');
@@ -457,24 +636,17 @@ class _ProofTileState extends State<_ProofTile> {
 
   @override
   Widget build(BuildContext context) {
-    final studentUid = widget.data['studentUid'] as String? ?? '—';
-    final rssi       = widget.data['rssi'] as int? ?? 0;
-    final rssiText   = rssi == 0 ? 'GATT' : '$rssi dBm';
-    final timestamp  = widget.data['timestamp'];
-
-    // Truncated UID used as placeholder while the name loads.
-    final uidShort = studentUid.length > 16
-        ? '${studentUid.substring(0, 16)}…'
-        : studentUid;
+    final rssi     = widget.proof.rssi;
+    final rssiText = rssi == 0 ? 'GATT' : '$rssi dBm';
+    final uidShort = widget.proof.studentUid.length > 16
+        ? '${widget.proof.studentUid.substring(0, 16)}…'
+        : widget.proof.studentUid;
 
     return FutureBuilder<String>(
       future: _nameFuture,
       builder: (context, snapshot) {
-        // While loading, show the UID (same as before). On resolve, show name.
-        final displayName = snapshot.data ?? uidShort;
-        final resolved    = snapshot.connectionState == ConnectionState.done;
-        // Show initials in avatar only once the name is resolved AND it looks
-        // like a real name (not a fallback UID).
+        final displayName  = snapshot.data ?? uidShort;
+        final resolved     = snapshot.connectionState == ConnectionState.done;
         final showInitials = resolved && !_isUid(displayName);
 
         return Container(
@@ -482,7 +654,7 @@ class _ProofTileState extends State<_ProofTile> {
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
           child: Row(
             children: [
-              // ── Avatar ─────────────────────────────────────────────────
+              // ── Avatar ───────────────────────────────────────────────────
               Container(
                 width: 38,
                 height: 38,
@@ -509,7 +681,7 @@ class _ProofTileState extends State<_ProofTile> {
               ),
               const SizedBox(width: 12),
 
-              // ── Name + signal ───────────────────────────────────────────
+              // ── Name + signal ─────────────────────────────────────────────
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -525,7 +697,7 @@ class _ProofTileState extends State<_ProofTile> {
                     ),
                     const SizedBox(height: 2),
                     Text(
-                      'Signal: $rssiText  ·  ${_formatTime(timestamp)}',
+                      'Signal: $rssiText  ·  ${_formatTime(widget.proof.timestamp)}',
                       style: const TextStyle(
                           color: AppTheme.secondaryTextColor, fontSize: 11),
                     ),
@@ -533,12 +705,16 @@ class _ProofTileState extends State<_ProofTile> {
                 ),
               ),
 
-              // ── Synced indicator ────────────────────────────────────────
-              // Always true here — docs only appear after Firestore write.
-              const Icon(
-                Icons.cloud_done_outlined,
+              // ── Sync indicator ─────────────────────────────────────────────
+              // Cloud icon when from Firestore, BLE icon when from local Drift.
+              Icon(
+                widget.proof.isLocal
+                    ? Icons.bluetooth
+                    : Icons.cloud_done_outlined,
                 size: 18,
-                color: AppTheme.successColor,
+                color: widget.proof.isLocal
+                    ? AppTheme.secondaryTextColor
+                    : AppTheme.successColor,
               ),
             ],
           ),

@@ -155,10 +155,17 @@ class MeshService {
 
   /// Broadcast [packet] to all currently visible peers via GATT.
   /// Also records the packet as seen locally (so we don't relay our own packets).
+  ///
+  /// SOS packets use `retryOnAllFailure: true` — if every GATT connection slot
+  /// is capped at the moment of broadcast, the packet is queued and retried
+  /// every 3 seconds for up to 30 seconds (Fix 2C). Other types rely on their
+  /// own re-broadcast timers (attendance: 5 s, social: no retry needed).
   Future<void> sendPacket(MeshPacket packet) async {
-    // Mark as seen so we don't relay our own origination.
     await _db.markPacketSeen(packet.id);
-    _transport.broadcastPacket(packet.toBytes());
+    _transport.broadcastPacket(
+      packet.toBytes(),
+      retryOnAllFailure: packet.type == PacketType.sos,
+    );
   }
 
   // ── Inbound — handle packets arriving from the BLE layer ──────────────────
@@ -236,8 +243,12 @@ class MeshService {
       final relayed = packet.decrementTtl();
       if (relayed.isExpired) return;
 
-      // Fire-and-forget — GATT errors are handled inside broadcastPacket.
-      _transport.broadcastPacket(relayed.toBytes());
+      // SOS relays also use the retry queue — a relay node failing to reach
+      // its peers should retry for the same 30-second window (Fix 2C).
+      _transport.broadcastPacket(
+        relayed.toBytes(),
+        retryOnAllFailure: relayed.type == PacketType.sos,
+      );
     });
   }
 }

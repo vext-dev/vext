@@ -156,12 +156,38 @@ class AttendanceService {
   Timer? _tokenRefreshTimer;
 
   // ── Student-side RSSI cache ────────────────────────────────────────────────
-  // Maps sessionId → best RSSI seen from advertisement path.
-  // When a GATT proof is assembled, we upgrade rssi=0 with this value if present.
-  final Map<String, int> _advertisementRssiCache = {};
+  // Tracks the best (least-negative = physically closest) RSSI seen from any
+  // attendance advertisement in the last 30 seconds.
+  //
+  // We do NOT key by sessionId or packet UUID here because:
+  //   - Advertisement-path packets carry NO sessionId (only type+ttl+uuid).
+  //   - The sessionId only arrives with the full GATT packet.
+  //   - In a classroom there is one active teacher session at a time.
+  //
+  // The bug in the previous implementation: the check read from
+  //   _advertisementRssiCache[adv.packet.id]   ← always null (nothing stored there)
+  // but the store wrote to
+  //   _advertisementRssiCache['__latest__']    ← the check was always skipped
+  // so every advertisement overwrote the cache unconditionally, discarding
+  // any better reading captured earlier.
+  //
+  // Fix: use two plain fields with an explicit "best RSSI" comparison and a
+  // 30-second staleness window so stale values from a previous session are
+  // never applied to the next proof assembly.
+  int? _bestAdvertisementRssi;
+  DateTime? _bestAdvertisementRssiTime;
 
   // ── Student-side already-submitted sessions ────────────────────────────────
   final Set<String> _submittedSessionIds = {};
+
+  // ── Teacher-side ACK deduplication (Fix 4A) ────────────────────────────────
+  // Tracks "sessionId:studentUid" pairs already written to local Drift DB via
+  // BLE ACK. Without this, re-broadcast ACKs (e.g. student sends 3 ACKs before
+  // teacher receives one) create duplicate rows because Drift's primary key is
+  // the proof UUID which we generate fresh each time — NOT studentUid.
+  // This is faster than a DB lookup and has no race condition: it's only
+  // written from the single mesh event handler on the Dart event loop.
+  final Set<String> _localAckedStudents = {};
 
   // ── Stream controllers ─────────────────────────────────────────────────────
   final _statusController =
@@ -174,6 +200,10 @@ class AttendanceService {
   // ── Subscriptions ─────────────────────────────────────────────────────────
   StreamSubscription<MeshPacket>? _packetSub;
   StreamSubscription<AttendanceAdvertisement>? _advSub;
+  /// Teacher-side: listens for ACK packets sent by students after marking
+  /// attendance. Writes a local Drift proof so the teacher's dashboard works
+  /// fully offline without Firestore (Fix 4A).
+  StreamSubscription<MeshPacket>? _ackSub;
 
   // ── Initialise ─────────────────────────────────────────────────────────────
 
@@ -185,6 +215,19 @@ class AttendanceService {
     // Student-side: advertisement-only packets (no payload, real RSSI)
     // Cache the best RSSI per session for use when GATT proof arrives.
     _advSub = _mesh.attendanceAdvertisements.listen(_onAttendanceAdvertisement);
+
+    // Teacher-side: ACK packets from students (Fix 4A).
+    // Students send an attendanceAck after successfully saving their proof.
+    // The teacher writes these to local Drift DB so the dashboard works offline.
+    //
+    // We wrap in a lambda rather than passing _onAttendanceAckPacket directly
+    // because the stream listener signature is void Function(T). If the handler
+    // were async the Future would be silently dropped. The wrapper makes the
+    // fire-and-forget explicit and errors surface via catchError instead of
+    // disappearing into an unhandled Future.
+    _ackSub = _mesh.ackPackets.listen((packet) {
+      _onAttendanceAckPacket(packet);
+    });
 
     _statusController.add(const AttendanceStatus.idle());
   }
@@ -216,33 +259,19 @@ class AttendanceService {
       currentHmacToken: hmacToken,
     );
 
-    // Write session doc to Firestore and wait for it to reach the server
-    // BEFORE returning. This is not optional:
+    // Write session doc to Firestore's local cache (instant — works offline).
+    // Firestore offline persistence queues the write and delivers it to the
+    // server automatically when connectivity is available.
     //
-    // watchFirestoreProofs() opens a Firestore stream on:
-    //   attendance/{sessionId}/proofs/{studentUid}
+    // We do NOT call waitForPendingWrites() here. That call blocks for up to
+    // 10 seconds without internet, freezing the UI before BLE even starts.
+    // The session is valid the moment it is written to the local cache — BLE
+    // broadcasting starts immediately below, regardless of internet state.
     //
-    // The security rule for that stream is:
-    //   allow read: if isTeacher() &&
-    //     get(/databases/.../sessions/{sessionId}).data.teacherUid == request.auth.uid;
-    //
-    // Firestore security rules ALWAYS evaluate get() against the server —
-    // never the local offline cache. If this method returned before the session
-    // doc reached the server, the rule's get() would see a missing document,
-    // .data.teacherUid would be null, the rule would fail, and the teacher's
-    // proof stream would immediately error with permission-denied.
-    //
-    // 10-second timeout: if the device is offline, we proceed anyway. The
-    // session is still broadcasting over BLE; Firestore will sync when the
-    // device reconnects. The proof stream will be empty or in error until then.
+    // Consequence: watchFirestoreProofs() will show a permission-denied error
+    // until the session doc reaches the Firestore server (requires internet).
+    // The local BLE attendance flow (Fix 4A) is the offline fallback.
     await _writeSessionToFirestore(_activeSession!);
-    await _firestore.waitForPendingWrites().timeout(
-      const Duration(seconds: 10),
-      onTimeout: () {
-        debugPrint('[Attendance] waitForPendingWrites timed out — '
-            'device may be offline; watchFirestoreProofs may error until sync');
-      },
-    );
 
     // Broadcast immediately, then on a timer.
     await _broadcastAttendancePacket();
@@ -285,13 +314,17 @@ class AttendanceService {
     }
 
     _activeSession = null;
+    // Clear teacher-side ACK dedup cache when session ends.
+    _localAckedStudents.clear();
   }
 
   /// Live stream of attendance proofs for [sessionId] from the LOCAL Drift DB.
   ///
-  /// NOTE: In a two-phone scenario this stream is empty on the teacher's device
-  /// because student proofs are written to the STUDENT's local DB and synced to
-  /// Firestore. Use [watchFirestoreProofs] for the teacher dashboard view.
+  /// After Fix 4A this stream is non-empty on the teacher's device: when a
+  /// student marks attendance and sends an ACK packet via BLE, [_onAttendanceAckPacket]
+  /// writes it here. This is the offline dashboard source when Firestore is
+  /// unavailable. For the full cloud-synced view (students not in BLE range),
+  /// use [watchFirestoreProofs] — TeacherSessionScreen shows both with fallback.
   Stream<List<AttendanceProof>> watchProofs(String sessionId) {
     return _db.watchProofsForSession(sessionId);
   }
@@ -340,9 +373,12 @@ class AttendanceService {
     await stopSession();
     await _packetSub?.cancel();
     await _advSub?.cancel();
+    await _ackSub?.cancel();
     _statusController.close();
-    _advertisementRssiCache.clear();
+    _bestAdvertisementRssi = null;
+    _bestAdvertisementRssiTime = null;
     _submittedSessionIds.clear();
+    _localAckedStudents.clear();
   }
 
   // ── Private — broadcast ────────────────────────────────────────────────────
@@ -397,15 +433,26 @@ class AttendanceService {
   }
 
   void _onAttendanceAdvertisement(AttendanceAdvertisement adv) {
-    // Cache best (highest = closest) RSSI per session.
-    // "Best" = least negative = physically closest measurement.
-    final existing = _advertisementRssiCache[adv.packet.id];
-    if (existing == null || adv.rssi > existing) {
-      // We use packet.id (the advertisement UUID) as a session proxy here.
-      // The actual sessionId only arrives via the GATT full packet.
-      // Store keyed by a temporary key; AttendanceService will use this
-      // when assembling the proof if a GATT packet arrives shortly after.
-      _advertisementRssiCache['__latest__'] = adv.rssi;
+    // Keep the best (least-negative = physically closest) RSSI seen from
+    // any attendance advertisement in the last 30 seconds.
+    //
+    // "Best" means the reading where the student was physically closest to
+    // the teacher at the time of scanning — higher RSSI (less negative) is
+    // better. We update only if the new reading is better than the stored one.
+    //
+    // The 30-second window ensures stale readings from a previous session
+    // are never accidentally applied to the current proof assembly.
+    final now = DateTime.now();
+    final isStale = _bestAdvertisementRssiTime == null ||
+        now.difference(_bestAdvertisementRssiTime!) >
+            const Duration(seconds: 30);
+
+    final isBetter = _bestAdvertisementRssi == null ||
+        adv.rssi > _bestAdvertisementRssi!;
+
+    if (isStale || isBetter) {
+      _bestAdvertisementRssi = adv.rssi;
+      _bestAdvertisementRssiTime = now;
     }
   }
 
@@ -414,14 +461,30 @@ class AttendanceService {
     required String hmacToken,
     required int gattRssi,
   }) async {
-    // Upgrade RSSI with advertisement value if we have one nearby.
-    final advertisementRssi = _advertisementRssiCache.remove('__latest__');
+    // Upgrade RSSI with the best advertisement-path reading if it was captured
+    // within the last 30 seconds. Clear the cache after consuming it so a
+    // single advertisement reading is never applied to two different proofs.
+    int? advertisementRssi;
+    final rssiCheckTime = DateTime.now();
+    if (_bestAdvertisementRssi != null &&
+        _bestAdvertisementRssiTime != null &&
+        rssiCheckTime.difference(_bestAdvertisementRssiTime!) <=
+            const Duration(seconds: 30)) {
+      advertisementRssi = _bestAdvertisementRssi;
+    }
+    // Clear cache regardless — prevents stale data from leaking into the next proof.
+    _bestAdvertisementRssi = null;
+    _bestAdvertisementRssiTime = null;
+
     final effectiveRssi = advertisementRssi ?? gattRssi;
 
-    // Check minimum RSSI gate (-90 dBm = mesh minimum; attendance uses -75 dBm).
-    // GATT rssi=0 bypasses the gate (we trust GATT connection proximity).
+    // Check minimum RSSI gate. GATT rssi=0 bypasses the gate (we trust
+    // GATT connection proximity — a connection at all requires < 15 m).
+    // Advertisement RSSI uses rssiThresholdAttendance (-85 dBm) which is
+    // intentionally softer than the mesh relay threshold (-75 dBm) to avoid
+    // false-rejections caused by body shielding or device orientation.
     if (effectiveRssi != 0 &&
-        effectiveRssi < AppConstants.rssiThresholdDefault) {
+        effectiveRssi < AppConstants.rssiThresholdAttendance) {
       // Too far away — do not mark present.
       _statusController.add(AttendanceStatus(
         type: AttendanceStatusType.error,
@@ -450,6 +513,22 @@ class AttendanceService {
       await _db.upsertAttendanceProof(proof);
       _submittedSessionIds.add(sessionId);
 
+      // Send an ACK packet back to the mesh (Fix 4A).
+      // The teacher's AttendanceService listens to ackPackets and writes the
+      // ACK to its local Drift DB, enabling an offline attendance dashboard.
+      // TTL=3: short hop — only needs to reach the teacher node.
+      // Fire-and-forget: ACK delivery is best-effort; the student's proof is
+      // already saved locally and will sync to Firestore when online.
+      _mesh.sendPacket(
+        MeshPacket.attendanceAck(
+          id: const Uuid().v4(),
+          senderUid: _currentUserUid,
+          sessionId: sessionId,
+          hmacToken: hmacToken,
+          rssi: effectiveRssi,
+        ),
+      ).ignore();
+
       // Trigger immediate sync so proof appears in teacher's Firebase dashboard.
       _syncEngine.syncNow().ignore();
 
@@ -468,14 +547,77 @@ class AttendanceService {
     }
   }
 
+  // ── Private — Teacher ACK handler (Fix 4A) ─────────────────────────────────
+
+  /// Called when an ACK packet arrives on the mesh.
+  ///
+  /// If this device is the active teacher and the ACK is for our current session,
+  /// write the student's proof to local Drift DB. This gives the teacher a
+  /// live attendance list that works fully offline — no Firestore needed.
+  ///
+  /// Deduplication: handled by [_localAckedStudents], an in-memory Set keyed
+  /// by "sessionId:studentUid". Drift's primary key is the proof UUID (generated
+  /// fresh per ACK), so DB-level dedup alone would not prevent duplicates.
+  void _onAttendanceAckPacket(MeshPacket packet) {
+    // Only process ACKs if we are the active teacher.
+    final session = _activeSession;
+    if (session == null || !session.isActive) return;
+
+    // Ignore our own echoed packets.
+    if (packet.senderUid == _currentUserUid) return;
+
+    final decoded = packet.decodeAttendanceAckPayload();
+    if (decoded == null) return;
+
+    // Only process ACKs for our current session.
+    if (decoded.sessionId != session.id) return;
+
+    // Dedup: one local proof per student per session.
+    // The Drift primary key is the proof UUID (not studentUid), so if we
+    // generate a fresh UUID per ACK, re-broadcasts create duplicate rows and
+    // the teacher's list shows the same student multiple times.
+    // _localAckedStudents is the authoritative in-memory dedup guard —
+    // cheaper than a DB query and race-free (single event-loop thread).
+    final ackKey = '${session.id}:${packet.senderUid}';
+    if (_localAckedStudents.contains(ackKey)) return;
+    _localAckedStudents.add(ackKey);
+
+    debugPrint('[Attendance] Teacher received ACK from ${packet.senderUid} '
+        '— writing local proof (offline fallback)');
+
+    // Build a local proof from the ACK data.
+    // proofId is a fresh UUID — the student's proofId is not transmitted.
+    // Dedup is handled by _localAckedStudents above, not by the DB primary key.
+    final localProof = AttendanceProofsCompanion(
+      id: Value(const Uuid().v4()),
+      sessionId: Value(session.id),
+      studentUid: Value(packet.senderUid),
+      hmacToken: Value(decoded.hmacToken),
+      rssi: Value(decoded.rssi),
+      timestamp: Value(packet.timestamp),
+      gpsLat: const Value<double?>(null),
+      gpsLng: const Value<double?>(null),
+      // Mark synced=true — the STUDENT's device handles the Firestore upload.
+      // We don't want the teacher's sync engine to re-upload this proof.
+      synced: const Value(true),
+    );
+
+    _db.upsertAttendanceProof(localProof).catchError((e) {
+      debugPrint('[Attendance] Failed to write ACK proof locally: $e');
+    });
+  }
+
   // ── Private — Firestore ────────────────────────────────────────────────────
 
-  /// Write (or update) the session document in Firestore.
+  /// Write (or update) the session document in Firestore's local cache.
   ///
-  /// Returns a Future so callers can await it. [startSession] awaits this
-  /// plus [waitForPendingWrites] to guarantee the session doc exists on the
-  /// Firestore server before [watchFirestoreProofs] is opened. [stopSession]
-  /// does NOT await it — marking a session inactive is not security-critical.
+  /// The write is committed to the local offline cache immediately (no network
+  /// required). Firestore's persistence layer delivers it to the server when
+  /// connectivity is available.
+  ///
+  /// [startSession] awaits this call so the session object exists in the cache
+  /// before BLE broadcasting begins. [stopSession] does NOT await it — marking
+  /// a session inactive is not security-critical.
   Future<void> _writeSessionToFirestore(AttendanceSession session) {
     return _firestore
         .collection(AppConstants.fsSessions)

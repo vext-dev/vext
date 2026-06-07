@@ -60,6 +60,16 @@
     <uses-permission android:name="android.permission.VIBRATE" />
     <!-- Keep CPU running while BLE scanning in background (Doze bypass) -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Schedule exact alarms that fire even in deep Doze mode (Fix 1B).
+         USE_EXACT_ALARM: auto-granted for safety/communication apps on API 33+.
+         SCHEDULE_EXACT_ALARM: user-approval variant on API 31-32; we fall back
+         to setAndAllowWhileIdle (inexact but Doze-exempt) if not granted. -->
+    <uses-permission
+        android:name="android.permission.USE_EXACT_ALARM"
+        tools:targetApi="33" />
+    <uses-permission
+        android:name="android.permission.SCHEDULE_EXACT_ALARM"
+        tools:targetApi="31" />
     <!-- POST_NOTIFICATIONS: required on Android 13+ to show FCM / SOS banners -->
     <uses-permission
         android:name="android.permission.POST_NOTIFICATIONS"
@@ -116,6 +126,20 @@
             android:name="id.flutter.flutter_background_service.BackgroundService"
             android:foregroundServiceType="connectedDevice"
             tools:node="merge" />
+
+        <!-- ── VextAlarmReceiver — deep-Doze BLE scan restarter (Fix 1B) ─────────
+             Receives the setExactAndAllowWhileIdle alarm and pushes a
+             "scanRestart" event to BleTransportLayer via the alarm_events
+             EventChannel. android:exported="false" — only the system AlarmManager
+             (which has implicit access) needs to broadcast to this receiver.
+             ──────────────────────────────────────────────────────────────── -->
+        <receiver
+            android:name=".VextAlarmReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.example.vext.DOZE_SCAN_RESTART" />
+            </intent-filter>
+        </receiver>
 
         <!-- Flutter tool meta-data — do not delete -->
         <meta-data

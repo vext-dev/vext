@@ -14,6 +14,15 @@ abstract class AppConstants {
   /// Default RSSI threshold for attendance verification (-75 dBm ≈ 8-10 m).
   static const int rssiThresholdDefault = -75;
 
+  /// Attendance-specific RSSI gate (-85 dBm ≈ 15-20 m).
+  ///
+  /// Looser than rssiThresholdDefault because classroom RSSI is highly variable:
+  /// body shielding, device orientation, and furniture can drop a physically-
+  /// close device to -80 or -85 dBm even when seated two rows away.
+  /// -85 dBm still rules out students in adjacent rooms while accepting all
+  /// students genuinely present in the same room.
+  static const int rssiThresholdAttendance = -85;
+
   /// Minimum RSSI to consider a peer "nearby" for mesh relay.
   static const int rssiMeshMinimum = -90;
 
@@ -58,6 +67,16 @@ abstract class AppConstants {
 
   /// Sleep period (ms) during SOS mode.
   static const int dutyCycleSleepMsSos = 100;
+
+  // ── GATT Connection Limits ────────────────────────────────────────────────
+  /// Maximum number of simultaneous GATT client connections when broadcasting.
+  ///
+  /// Android supports up to 7 concurrent GATT connections device-wide, but
+  /// real-world testing on Samsung / Pixel shows > 3 simultaneous connects
+  /// causes GATT_ERROR 133 (connection failures) under load. Keeping this at
+  /// 3 leaves headroom for the GATT server (incoming connections from peers)
+  /// and prevents BLE radio saturation.
+  static const int maxConcurrentGattConnections = 3;
 
   // ── Exponential Backoff ───────────────────────────────────────────────────
   /// Base delay (ms) for exponential backoff relay.

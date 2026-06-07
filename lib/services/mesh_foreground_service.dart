@@ -85,6 +85,33 @@ Future<void> _onBackgroundStart(ServiceInstance service) async {
     service.stopSelf();
   });
 
+  // ── Message: boostSos (Fix 5A) ────────────────────────────────────────────
+  // Sent by SosService.triggerSos() when an SOS is triggered.
+  // Re-asserts foreground service priority and updates notification to SOS
+  // mode. On Samsung and Xiaomi OEM ROMs, the OS may silently demote a
+  // foreground service if the user navigates away during normal operation.
+  // Re-calling setAsForegroundService() during SOS prevents this demotion
+  // when it matters most.
+  service.on('boostSos').listen((_) async {
+    debugPrint('[FGService] SOS boost — re-asserting foreground priority');
+    await androidService?.setAsForegroundService();
+    androidService?.setForegroundNotificationInfo(
+      title: '🚨 SOS ACTIVE',
+      content: 'Emergency broadcast in progress — do not close the app.',
+    );
+  });
+
+  // ── Message: revertSos (Fix 5A) ───────────────────────────────────────────
+  // Sent by SosService.cancelSos() when the SOS is cancelled.
+  // Reverts the notification back to the standard mesh status text.
+  service.on('revertSos').listen((_) {
+    debugPrint('[FGService] SOS cancelled — reverting notification');
+    androidService?.setForegroundNotificationInfo(
+      title: AppConstants.foregroundServiceNotificationTitle,
+      content: AppConstants.foregroundServiceNotificationBody,
+    );
+  });
+
   // ── Heartbeat ─────────────────────────────────────────────────────────────
   // Keeps the isolate alive. Without at least one active listener or timer,
   // the Dart event loop exits and the isolate dies (taking the service with it).
@@ -199,5 +226,28 @@ class MeshForegroundService {
             : 'Mesh active · $peerCount peers nearby';
 
     _service.invoke('updateNotification', {'content': content});
+  }
+
+  // ── boostForSos / revertFromSos (Fix 5A) ──────────────────────────────────
+
+  /// Boost foreground service priority and switch notification to SOS mode.
+  ///
+  /// Called by [SosService.triggerSos]. Re-asserts setAsForegroundService()
+  /// in the background isolate — this prevents Samsung One UI and Xiaomi MIUI
+  /// from silently demoting the notification priority when the user navigates
+  /// away during an active SOS, which would allow the OS to throttle or kill
+  /// the process at the worst possible time.
+  static void boostForSos() {
+    _service.invoke('boostSos');
+    debugPrint('[FGService] boostSos invoked');
+  }
+
+  /// Revert to standard notification after SOS is cancelled.
+  ///
+  /// Called by [SosService.cancelSos]. Restores normal notification text
+  /// so the user is not alarmed after the emergency is resolved.
+  static void revertFromSos() {
+    _service.invoke('revertSos');
+    debugPrint('[FGService] revertSos invoked');
   }
 }
