@@ -259,19 +259,31 @@ class AttendanceService {
       currentHmacToken: hmacToken,
     );
 
-    // Write session doc to Firestore's local cache (instant — works offline).
-    // Firestore offline persistence queues the write and delivers it to the
-    // server automatically when connectivity is available.
+    // Fire-and-forget Firestore session write (Fix: offline session start).
     //
-    // We do NOT call waitForPendingWrites() here. That call blocks for up to
-    // 10 seconds without internet, freezing the UI before BLE even starts.
-    // The session is valid the moment it is written to the local cache — BLE
-    // broadcasting starts immediately below, regardless of internet state.
+    // PREVIOUS BUG: `await _writeSessionToFirestore(...)` blocked startSession()
+    // on Firestore connectivity. When offline, Firestore threw a
+    // network-request-failed exception instead of silently writing to its local
+    // cache. This caused startSession() to throw, BLE broadcasting never started,
+    // and students received no attendance packet — the whole lane went dark.
     //
-    // Consequence: watchFirestoreProofs() will show a permission-denied error
-    // until the session doc reaches the Firestore server (requires internet).
-    // The local BLE attendance flow (Fix 4A) is the offline fallback.
-    await _writeSessionToFirestore(_activeSession!);
+    // FIX: Fire-and-forget. The session is fully valid the moment _activeSession
+    // is set above. All session data (sessionId, hmacToken) is generated locally.
+    // BLE broadcasting is the primary transport and starts immediately below.
+    // Firestore receives the session doc when connectivity is available — it is
+    // only needed for the cloud proof dashboard, not for the BLE attendance flow.
+    //
+    // KNOWN RACE (low impact, deferred to Track 2 milestone):
+    // If students' proofs sync to Firestore before the session doc arrives,
+    // the security rule rejects them. The FirebaseSyncEngine retries every 10s —
+    // proofs succeed on the next attempt once the session doc is present.
+    // No data is lost. The teacher's BLE dashboard (Fix 4A) is unaffected.
+    //
+    // Track 2 (future milestone — NOT immediate): Add SessionRecords to Drift DB,
+    // sync sessions via FirebaseSyncEngine with session-first ordering guarantee,
+    // and update Firestore rules to eliminate this race window entirely.
+    // See VEXT_PROJECT_REPORT.md §8 for full scope and risk analysis.
+    _writeSessionToFirestore(_activeSession!).ignore();
 
     // Broadcast immediately, then on a timer.
     await _broadcastAttendancePacket();
