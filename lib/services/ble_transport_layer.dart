@@ -38,6 +38,9 @@
 //   MethodChannel "com.example.vext/ble_advertiser"  → BLE peripheral advertising
 //   MethodChannel "com.example.vext/gatt_server"     → GATT server lifecycle
 //   EventChannel  "com.example.vext/gatt_packets"    → incoming GATT packet bytes
+//   MethodChannel "com.example.vext/wake_lock"       → PARTIAL_WAKE_LOCK (Fix 1A)
+//   MethodChannel "com.example.vext/alarm_manager"   → Doze alarm scheduling (Fix 1B)
+//   EventChannel  "com.example.vext/alarm_events"    → Doze alarm fired events (Fix 1B)
 //
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -91,6 +94,22 @@ class BleTransportLayer {
   static const _gattPacketsChannel =
       EventChannel('com.example.vext/gatt_packets');
 
+  /// WakeLock channel — keeps the CPU alive while BLE scanning runs.
+  /// 'acquireWakeLock' / 'releaseWakeLock' are handled by MainActivity.kt.
+  static const _wakeLockChannel =
+      MethodChannel('com.example.vext/wake_lock');
+
+  /// AlarmManager channel — schedules a one-shot setExactAndAllowWhileIdle
+  /// alarm. Fired even in deep Doze; rescheduled from Dart after each receipt.
+  static const _alarmManagerChannel =
+      MethodChannel('com.example.vext/alarm_manager');
+
+  /// Receives "scanRestart" strings from VextAlarmReceiver when the Doze
+  /// alarm fires. BleTransportLayer calls _restartDutyCycle() on each event
+  /// and immediately reschedules the next alarm (Fix 1B).
+  static const _alarmEventsChannel =
+      EventChannel('com.example.vext/alarm_events');
+
   // ── BLE UUIDs ─────────────────────────────────────────────────────────────
 
   static final Guid _vextServiceUuid = Guid(AppConstants.bleServiceUuid);
@@ -106,11 +125,22 @@ class BleTransportLayer {
   bool _running = false;
   ScanDutyMode _dutyMode = ScanDutyMode.idle;
 
+  /// Number of GATT client operations currently in-flight.
+  /// Capped at [AppConstants.maxConcurrentGattConnections] to prevent BLE
+  /// radio exhaustion. Incremented at the start of sendPacketToPeer(),
+  /// decremented in the finally block (always, even on error/timeout).
+  int _activeGattConnections = 0;
+
   /// device remoteId → last RSSI (currently visible VEXT peers)
   final Map<String, int> _peerRssi = {};
 
   /// device remoteId → BluetoothDevice (for GATT client writes)
   final Map<String, BluetoothDevice> _peerDevices = {};
+
+  /// device remoteId → time of last scan result — used for stale-peer eviction.
+  /// Peers not seen for 60 s are removed from _peerRssi and _peerDevices so
+  /// broadcastPacket() does not try to GATT-connect to out-of-range devices.
+  final Map<String, DateTime> _peerLastSeen = {};
 
   // ── Callbacks ─────────────────────────────────────────────────────────────
 
@@ -127,7 +157,30 @@ class BleTransportLayer {
   StreamSubscription<List<ScanResult>>? _scanSub;
   StreamSubscription<BluetoothAdapterState>? _adapterSub;
   StreamSubscription<dynamic>? _gattPacketSub;
+  /// Receives Doze-alarm events from VextAlarmReceiver (Fix 1B).
+  StreamSubscription<dynamic>? _alarmEventSub;
   Timer? _dutyCycleTimer;
+  Timer? _evictionTimer;
+
+  // ── Retry queue (Fix 2C) ──────────────────────────────────────────────────
+  // Packets whose broadcastPacket() call reached all peers successfully on 0
+  // devices (all GATT slots busy, or no peers present) are queued here and
+  // retried every [_retryIntervalMs] ms up to [_retryMaxAgeMs] ms.
+  // Limited to [_retryQueueMaxSize] to bound memory.
+  static const _retryIntervalMs = 3000;
+  static const _retryMaxAgeMs   = 30000; // 30 s — covers 15 SOS re-broadcast cycles
+  static const _retryQueueMaxSize = 8;
+  final _retryQueue = <({List<int> bytes, DateTime expiresAt})>[];
+  Timer? _retryTimer;
+
+  // ── Health watchdog (Fix 1C) ──────────────────────────────────────────────
+  // Periodically checks whether the duty-cycle timer is still alive. If it
+  // has died silently (e.g., an uncaught exception in the timer callback in a
+  // release build), the watchdog restarts it. Fires every 2 minutes — frequent
+  // enough to recover before a user notices, infrequent enough to have zero
+  // battery impact.
+  Timer? _watchdogTimer;
+  DateTime? _lastScanActivityTime; // updated on every scan callback (empty or not)
 
   // ── Public API ─────────────────────────────────────────────────────────────
 
@@ -145,8 +198,12 @@ class BleTransportLayer {
     _dutyMode = mode;
 
     if (_running) {
-      // Mode changed while already running — update duty cycle only.
+      // Mode changed while already running — update duty cycle AND reschedule
+      // the Doze alarm at the new mode's interval. Without the reschedule, the
+      // old alarm (e.g. 1 s for session mode) fires immediately after switching
+      // to idle (31 s cycle), causing a spurious duty-cycle restart.
       _restartDutyCycle();
+      _scheduleDozeAlarm().ignore();
       return;
     }
 
@@ -183,6 +240,53 @@ class BleTransportLayer {
 
     await _startScanOnce();
     _scheduleDutyCycle();
+
+    // Evict peers not seen for 60 s every 30 s to keep broadcastPacket() lean.
+    _evictionTimer ??= Timer.periodic(
+      const Duration(seconds: 30),
+      (_) => _evictStalePeers(),
+    );
+
+    // Acquire a PARTIAL_WAKE_LOCK so Android does not sleep the CPU between
+    // duty-cycle timer firings. Without this, Dart timers stall in Doze mode
+    // and scanning stops silently whenever the screen turns off.
+    // Non-fatal — some emulators and non-Android targets don't have this channel.
+    try {
+      await _wakeLockChannel.invokeMethod<bool>('acquireWakeLock');
+      debugPrint('[BLE] WakeLock acquired');
+    } catch (e) {
+      debugPrint('[BLE] WakeLock unavailable: $e');
+    }
+
+    // Subscribe to Doze alarm events from VextAlarmReceiver (Fix 1B).
+    // When deep Doze suspends the Dart event loop and stalls the duty-cycle
+    // timer, the AlarmManager fires setExactAndAllowWhileIdle which wakes the
+    // device and calls back here — we restart the duty cycle immediately.
+    _alarmEventSub = _alarmEventsChannel.receiveBroadcastStream().listen(
+      _onDozeAlarmEvent,
+      onError: (e) => debugPrint('[BLE] alarmEvents error: $e'),
+    );
+    // Schedule the initial Doze alarm. Interval = one full duty cycle
+    // (active + sleep) so it only fires if the normal Dart timer has stalled.
+    await _scheduleDozeAlarm();
+
+    // ── GATT retry timer (Fix 2C) ─────────────────────────────────────────
+    // Fires every 3 s to resend packets that previously had no available GATT
+    // connections. Complements the re-broadcast timers in SosService and
+    // AttendanceService — covers the window between broadcast cycles.
+    _retryTimer = Timer.periodic(
+      const Duration(milliseconds: _retryIntervalMs),
+      (_) => _processRetryQueue(),
+    );
+
+    // ── Health watchdog (Fix 1C) ──────────────────────────────────────────
+    // Every 2 minutes, verify the duty-cycle timer is still ticking.
+    // If it died silently (e.g. Doze killed the Dart VM timer callbacks even
+    // with the WakeLock), restart the duty cycle immediately.
+    _watchdogTimer = Timer.periodic(
+      const Duration(minutes: 2),
+      (_) => _checkBleHealth(),
+    );
   }
 
   /// Stop all scanning, advertising, and GATT operations.
@@ -192,6 +296,16 @@ class BleTransportLayer {
     _dutyCycleTimer?.cancel();
     _dutyCycleTimer = null;
 
+    _evictionTimer?.cancel();
+    _evictionTimer = null;
+
+    _retryTimer?.cancel();
+    _retryTimer = null;
+    _retryQueue.clear();
+
+    _watchdogTimer?.cancel();
+    _watchdogTimer = null;
+
     await _scanSub?.cancel();
     _scanSub = null;
 
@@ -200,6 +314,10 @@ class BleTransportLayer {
 
     await _gattPacketSub?.cancel();
     _gattPacketSub = null;
+
+    await _alarmEventSub?.cancel();
+    _alarmEventSub = null;
+    await _cancelDozeAlarm();
 
     if (FlutterBluePlus.isScanningNow) {
       await FlutterBluePlus.stopScan();
@@ -213,8 +331,16 @@ class BleTransportLayer {
       await _gattServerChannel.invokeMethod<bool>('stopServer');
     } catch (_) {}
 
+    // Release the WakeLock — BLE is off, no need to keep the CPU awake.
+    try {
+      await _wakeLockChannel.invokeMethod<bool>('releaseWakeLock');
+      debugPrint('[BLE] WakeLock released');
+    } catch (_) {}
+
     _peerRssi.clear();
     _peerDevices.clear();
+    _peerLastSeen.clear();
+    _activeGattConnections = 0; // reset in case any in-flight ops were abandoned
     onPeerCountChanged?.call(0);
   }
 
@@ -223,6 +349,10 @@ class BleTransportLayer {
     if (!_running) return;
     _dutyMode = mode;
     _restartDutyCycle();
+    // Reschedule Doze alarm at the new mode's interval so it matches the
+    // new duty cycle. Without this, the alarm keeps the old interval until
+    // it next fires and self-corrects — causing one spurious restart.
+    _scheduleDozeAlarm().ignore();
   }
 
   // ── Advertising ───────────────────────────────────────────────────────────
@@ -253,61 +383,138 @@ class BleTransportLayer {
 
   // ── GATT client — send packets to peers ───────────────────────────────────
 
-  /// Send [packetBytes] to a single peer via GATT write.
+  /// Send [packetBytes] to a single peer via GATT write, with up to 3 attempts.
   ///
-  /// Connect → discover services → find VEXT write characteristic → write → disconnect.
-  /// All errors are silently ignored — a failed write means the peer moved out of
-  /// range; MeshService / TTL policy handles retries.
-  Future<void> sendPacketToPeer(
+  /// Returns `true` on success, `false` if all 3 attempts failed or the
+  /// concurrency cap was already reached. The boolean result is used by
+  /// [broadcastPacket] to decide whether to enqueue for retry (Fix 2C).
+  ///
+  /// Connect → MTU negotiation → discover services → write → disconnect.
+  /// Backoff: 100 ms after attempt 1, 200 ms after attempt 2.
+  Future<bool> sendPacketToPeer(
     BluetoothDevice device,
     List<int> packetBytes,
   ) async {
+    // Guard: drop the send if we are already at the concurrent GATT limit.
+    // This prevents BLE radio saturation (GATT_ERROR 133) on Samsung / Pixel
+    // when broadcastPacket() fires many peers simultaneously.
+    // Return false so the caller knows this peer was not reached.
+    if (_activeGattConnections >= AppConstants.maxConcurrentGattConnections) {
+      return false;
+    }
+    _activeGattConnections++;
+
     try {
-      await device.connect(
-        timeout: const Duration(seconds: 5),
-        autoConnect: false,
-      );
+      for (int attempt = 0; attempt < 3; attempt++) {
+        try {
+          await device.connect(
+            timeout: const Duration(seconds: 5),
+            autoConnect: false,
+          );
 
-      final services = await device.discoverServices();
+          // Request maximum MTU before service discovery. Default ATT MTU is
+          // 23 bytes (20 bytes payload). A MeshPacket with content easily exceeds
+          // this. Requesting 512 causes Android to negotiate the largest MTU both
+          // ends support (typically 247 or 512 on modern devices), so the full
+          // packet is delivered in a single write operation instead of fragments.
+          // Errors here are non-fatal — we continue with the default MTU.
+          try {
+            await device.requestMtu(512);
+          } catch (_) {}
 
-      BluetoothService? vextService;
-      for (final s in services) {
-        if (s.serviceUuid == _vextServiceUuid) {
-          vextService = s;
-          break;
+          final services = await device.discoverServices();
+
+          BluetoothService? vextService;
+          for (final s in services) {
+            if (s.serviceUuid == _vextServiceUuid) {
+              vextService = s;
+              break;
+            }
+          }
+          if (vextService == null) {
+            await device.disconnect();
+            // VEXT service gone — peer likely rebooted mid-session. Return false
+            // but don't retry (the peer needs to re-advertise first).
+            return false;
+          }
+
+          BluetoothCharacteristic? writeChar;
+          for (final c in vextService.characteristics) {
+            if (c.characteristicUuid == _vextWriteCharUuid) {
+              writeChar = c;
+              break;
+            }
+          }
+          if (writeChar == null) {
+            await device.disconnect();
+            return false; // Characteristic gone — no point retrying.
+          }
+
+          await writeChar.write(packetBytes, withoutResponse: true);
+          await device.disconnect();
+          return true; // ── Success ──
+        } catch (_) {
+          try { await device.disconnect(); } catch (_) {}
+          if (attempt < 2) {
+            // Backoff: 100ms after attempt 0, 200ms after attempt 1.
+            await Future<void>.delayed(Duration(milliseconds: 100 * (attempt + 1)));
+          }
         }
       }
-      if (vextService == null) {
-        await device.disconnect();
-        return;
-      }
-
-      BluetoothCharacteristic? writeChar;
-      for (final c in vextService.characteristics) {
-        if (c.characteristicUuid == _vextWriteCharUuid) {
-          writeChar = c;
-          break;
-        }
-      }
-      if (writeChar == null) {
-        await device.disconnect();
-        return;
-      }
-
-      await writeChar.write(packetBytes, withoutResponse: true);
-      await device.disconnect();
-    } catch (_) {
-      try {
-        await device.disconnect();
-      } catch (_) {}
+      return false; // All 3 attempts failed.
+    } finally {
+      // Always decrement — even on early return or exception.
+      _activeGattConnections--;
     }
   }
 
-  /// Broadcast [packetBytes] to ALL currently known peers via GATT concurrently.
-  void broadcastPacket(List<int> packetBytes) {
-    final devices = List<BluetoothDevice>.from(_peerDevices.values);
-    for (final device in devices) {
-      sendPacketToPeer(device, packetBytes).ignore();
+  /// Broadcast [packetBytes] to up to 5 currently known peers concurrently.
+  ///
+  /// [retryOnAllFailure] — when true, if EVERY peer send returns false (all
+  /// GATT slots were capped, or no peers present), the packet is added to the
+  /// retry queue and re-attempted every [_retryIntervalMs] ms for up to
+  /// [_retryMaxAgeMs] ms. Use for SOS packets where delivery is critical.
+  /// For attendance/social, the lane-level re-broadcast timers cover retries.
+  ///
+  /// The public signature stays `void` so existing call sites (MeshService)
+  /// need no changes — the async work runs fire-and-forget internally.
+  void broadcastPacket(
+    List<int> packetBytes, {
+    bool retryOnAllFailure = false,
+  }) {
+    _broadcastAsync(packetBytes, retryOnAllFailure: retryOnAllFailure).ignore();
+  }
+
+  Future<void> _broadcastAsync(
+    List<int> packetBytes, {
+    bool retryOnAllFailure = false,
+  }) async {
+    // Guard: stop() may have been called while this Future was queued.
+    // Without this check a stale SOS packet could be enqueued AFTER stop()
+    // cleared _retryQueue, then replayed when start() is called next time.
+    if (!_running) return;
+
+    final devices = List<BluetoothDevice>.from(_peerDevices.values)
+        .take(5)
+        .toList();
+
+    if (devices.isEmpty) {
+      // No peers in range — queue immediately if retry is enabled.
+      // Re-check _running: stop() could have fired between the guard above
+      // and here (unlikely but possible in Dart's cooperative scheduler).
+      if (retryOnAllFailure && _running) _enqueueForRetry(packetBytes);
+      return;
+    }
+
+    // Send to all peers concurrently and collect success flags.
+    final results = await Future.wait(
+      devices.map((d) => sendPacketToPeer(d, packetBytes)),
+    );
+
+    // If every send failed (all GATT slots busy at the same moment), queue.
+    // Re-check _running: stop() may have been called during the awaits above.
+    if (retryOnAllFailure && _running && results.every((success) => !success)) {
+      _enqueueForRetry(packetBytes);
     }
   }
 
@@ -406,6 +613,13 @@ class BleTransportLayer {
   /// result.advertisementData.serviceUuids (populated from the advertisement's
   /// "Service UUID List" AD type — exactly what BleAdvertiser.addServiceUuid() sets).
   void _onScanResults(List<ScanResult> results) {
+    // Update watchdog heartbeat on EVERY scan callback — including empty results.
+    // Reason: in an empty room with no BLE peers, results is always empty and
+    // _lastScanActivityTime would never update. After 3× the duty cycle the
+    // watchdog would false-fire and restart unnecessarily. Updating here confirms
+    // the BLE stack is alive and delivering callbacks regardless of peer count.
+    _lastScanActivityTime = DateTime.now();
+
     final prevCount = _peerRssi.length;
 
     for (final result in results) {
@@ -421,6 +635,7 @@ class BleTransportLayer {
       final deviceId = result.device.remoteId.str;
       _peerRssi[deviceId] = rssi;
       _peerDevices[deviceId] = result.device; // retained for GATT client writes
+      _peerLastSeen[deviceId] = DateTime.now(); // for stale-peer eviction
 
       // If the peer included 18-byte MeshPacket header data in the scan response
       // manufacturer data, parse it. This is optional — full packets arrive
@@ -531,6 +746,32 @@ class BleTransportLayer {
     }
   }
 
+  // ── Private — Stale peer eviction ────────────────────────────────────────
+
+  /// Remove peers not seen in the last 60 seconds.
+  ///
+  /// Called every 30 s by [_evictionTimer]. Prevents [broadcastPacket] from
+  /// trying to GATT-connect to devices that have walked out of range, which
+  /// ties up GATT slots for the full 5-second connect timeout.
+  void _evictStalePeers() {
+    final cutoff = DateTime.now().subtract(const Duration(seconds: 60));
+    final stale = _peerLastSeen.entries
+        .where((e) => e.value.isBefore(cutoff))
+        .map((e) => e.key)
+        .toList();
+
+    if (stale.isEmpty) return;
+
+    for (final id in stale) {
+      _peerRssi.remove(id);
+      _peerDevices.remove(id);
+      _peerLastSeen.remove(id);
+    }
+    onPeerCountChanged?.call(_peerRssi.length);
+    debugPrint('[BLE] evicted ${stale.length} stale peer(s) — '
+        '${_peerRssi.length} peer(s) remain');
+  }
+
   // ── Private — Adapter state ───────────────────────────────────────────────
 
   void _onAdapterState(BluetoothAdapterState state) {
@@ -539,8 +780,142 @@ class BleTransportLayer {
     } else if (state != BluetoothAdapterState.on) {
       _peerRssi.clear();
       _peerDevices.clear();
+      _peerLastSeen.clear();
       onPeerCountChanged?.call(0);
     }
+  }
+
+  // ── Private — GATT retry queue (Fix 2C) ──────────────────────────────────
+
+  /// Add [packetBytes] to the retry queue if room is available.
+  ///
+  /// Duplicate detection: we don't dedup by content (too expensive for raw
+  /// bytes). Instead the queue is small (max 8) and short-lived (30 s TTL),
+  /// so at worst a packet is retried a handful of times.
+  void _enqueueForRetry(List<int> packetBytes) {
+    if (_retryQueue.length >= _retryQueueMaxSize) {
+      // Drop oldest entry to make room — fresh data is more useful.
+      _retryQueue.removeAt(0);
+    }
+    _retryQueue.add((
+      bytes: packetBytes,
+      expiresAt: DateTime.now().add(
+        const Duration(milliseconds: _retryMaxAgeMs),
+      ),
+    ));
+    debugPrint('[BLE] Retry queue: ${_retryQueue.length} packet(s) pending');
+  }
+
+  /// Drain expired entries and re-broadcast the rest.
+  ///
+  /// Called every [_retryIntervalMs] ms by [_retryTimer]. Uses the plain
+  /// `broadcastPacket` path WITHOUT `retryOnAllFailure` to avoid infinite
+  /// re-queuing if peers are still unavailable.
+  void _processRetryQueue() {
+    if (!_running || _retryQueue.isEmpty) return;
+
+    final now = DateTime.now();
+    _retryQueue.removeWhere((entry) => entry.expiresAt.isBefore(now));
+
+    if (_retryQueue.isEmpty) return;
+    if (_peerDevices.isEmpty) return; // No peers — keep in queue, try next cycle.
+
+    debugPrint('[BLE] Retry queue: flushing ${_retryQueue.length} packet(s)');
+
+    // Snapshot and clear — if sends fail again the caller (SOS re-broadcast)
+    // will re-add. We don't want stale entries accumulating indefinitely.
+    final pending = List.of(_retryQueue);
+    _retryQueue.clear();
+
+    for (final entry in pending) {
+      // No retryOnAllFailure — avoids infinite re-queue loops.
+      _broadcastAsync(entry.bytes).ignore();
+    }
+  }
+
+  // ── Private — BLE health watchdog (Fix 1C) ────────────────────────────────
+
+  /// Periodic health check — verifies the duty-cycle machinery is still alive.
+  ///
+  /// Checks two conditions:
+  ///   1. The duty-cycle timer is active (not null and not cancelled).
+  ///   2. Scan results have arrived within 3× the expected cycle period,
+  ///      confirming the BLE scanner is actually delivering data.
+  ///
+  /// If either check fails while [_running] is true, the duty cycle is
+  /// restarted immediately. This recovers from silent Dart timer death
+  /// that can occur on heavily memory-pressured devices even with a WakeLock.
+  void _checkBleHealth() {
+    if (!_running) return;
+
+    bool needsRestart = false;
+
+    // Check 1: duty-cycle timer must be alive.
+    if (_dutyCycleTimer == null || !_dutyCycleTimer!.isActive) {
+      debugPrint('[BLE] Watchdog: duty-cycle timer is dead — will restart');
+      needsRestart = true;
+    }
+
+    // Check 2: scan activity must be recent.
+    // Allow 3× the full duty cycle as tolerance (Doze may have delayed one cycle).
+    if (!needsRestart && _lastScanActivityTime != null) {
+      final cycleSecs =
+          (_scanDuration() + _sleepDuration()).inSeconds.clamp(1, 3600);
+      final staleSecs = DateTime.now()
+          .difference(_lastScanActivityTime!)
+          .inSeconds;
+      if (staleSecs > cycleSecs * 3) {
+        debugPrint('[BLE] Watchdog: no scan activity for ${staleSecs}s '
+            '(expected < ${cycleSecs * 3}s) — will restart');
+        needsRestart = true;
+      }
+    }
+
+    if (needsRestart) {
+      _restartDutyCycle();
+      // Also reschedule the Doze alarm in case it expired while we were stuck.
+      _scheduleDozeAlarm().ignore();
+    }
+  }
+
+  // ── Private — Deep-Doze AlarmManager (Fix 1B) ────────────────────────────
+
+  /// Called by VextAlarmReceiver when the Doze alarm fires.
+  ///
+  /// Restarts the duty-cycle timer (the normal Dart timer was stalled by Doze)
+  /// and immediately schedules the next alarm so protection is continuous.
+  void _onDozeAlarmEvent(dynamic event) {
+    if (!_running) return;
+    debugPrint('[BLE] Doze alarm fired — restarting duty cycle');
+    _restartDutyCycle();
+    // Reschedule — setExactAndAllowWhileIdle is one-shot, must re-arm each time.
+    _scheduleDozeAlarm().ignore();
+  }
+
+  /// Schedule a one-shot Doze-safe alarm via AlarmManager (Fix 1B).
+  ///
+  /// Interval = full duty-cycle period (active + sleep). In idle mode this is
+  /// 31 seconds. The alarm is a safety net: if the normal Dart timer fires on
+  /// schedule it restarts the scan before the alarm fires. If Doze stalls the
+  /// timer, the alarm wakes the device and we restart from here.
+  Future<void> _scheduleDozeAlarm() async {
+    final intervalMs =
+        _scanDuration().inMilliseconds + _sleepDuration().inMilliseconds;
+    try {
+      await _alarmManagerChannel.invokeMethod<bool>(
+        'scheduleDozeAlarm',
+        {'intervalMs': intervalMs},
+      );
+    } catch (e) {
+      debugPrint('[BLE] scheduleDozeAlarm failed: $e');
+    }
+  }
+
+  /// Cancel any pending Doze alarm (called on BLE stop).
+  Future<void> _cancelDozeAlarm() async {
+    try {
+      await _alarmManagerChannel.invokeMethod<bool>('cancelDozeAlarm');
+    } catch (_) {}
   }
 
   // ── Private — Duty-cycle durations ───────────────────────────────────────

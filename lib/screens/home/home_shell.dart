@@ -4,6 +4,7 @@ import 'package:go_router/go_router.dart';
 
 import '../../core/app_theme.dart';
 import '../../providers/ble_provider.dart';
+import '../../services/ble_transport_layer.dart';
 
 // ── Tab definition ────────────────────────────────────────────────────────────
 
@@ -58,7 +59,8 @@ class AppShellScreen extends ConsumerStatefulWidget {
   ConsumerState<AppShellScreen> createState() => _AppShellScreenState();
 }
 
-class _AppShellScreenState extends ConsumerState<AppShellScreen> {
+class _AppShellScreenState extends ConsumerState<AppShellScreen>
+    with WidgetsBindingObserver {
   /// Derives the selected tab index from GoRouter's current location so the
   /// bottom bar stays in sync even when navigation happens programmatically
   /// (e.g. deep links, auth redirects).
@@ -70,13 +72,108 @@ class _AppShellScreenState extends ConsumerState<AppShellScreen> {
     return 0; // default to Attendance
   }
 
+  @override
+  void initState() {
+    super.initState();
+    // Register as a WidgetsBindingObserver so didChangeAppLifecycleState fires
+    // when the user returns from another app (e.g. camera for SOS photo).
+    WidgetsBinding.instance.addObserver(this);
+    // App always starts on Attendance tab after auth.
+    // Set session duty cycle immediately so the student's phone is ready to
+    // receive teacher attendance broadcasts from the first second.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _applyDutyCycleForTab(0);
+    });
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  /// Called whenever the app moves between foreground / background states.
+  ///
+  /// When the user returns to VEXT after using another app (camera, messages,
+  /// etc.), the Dart timer driving the BLE duty cycle may have stalled while
+  /// the main isolate was deprioritised by Android.
+  ///
+  /// On [AppLifecycleState.resumed] we call [setMode] on the transport layer,
+  /// which cancels the stale timer and immediately starts a fresh scan cycle.
+  /// This is cheap (no permission dialogs, no GATT setup) and guarantees that
+  /// BLE is back at full speed within ~100ms of the user returning to the app.
+  ///
+  /// SOS mode is never downgraded here — if an SOS is active the transport
+  /// layer is already in SOS duty cycle and [setMode] is idempotent.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) return;
+
+    final bleState = ref.read(bleStateProvider);
+    if (!bleState.isActive) return; // BLE not started yet — nothing to restart.
+
+    // Map the current MeshMode back to a ScanDutyMode and re-apply it.
+    // setMode() calls _restartDutyCycle() which cancels the stalled timer
+    // and starts a fresh scan immediately.
+    final transport = ref.read(bleTransportLayerProvider);
+    switch (bleState.mode) {
+      case MeshMode.sosMode:
+        transport.setMode(ScanDutyMode.sos).ignore();
+      case MeshMode.activeSession:
+        transport.setMode(ScanDutyMode.session).ignore();
+      case MeshMode.idle:
+        transport.setMode(ScanDutyMode.idle).ignore();
+    }
+    debugPrint('[Shell] App resumed — BLE duty cycle restarted '
+        '(mode: ${bleState.mode})');
+  }
+
   void _onTabTap(BuildContext context, int index) {
     final target = _tabs[index].route;
     final current = GoRouterState.of(context).uri.toString();
 
-    // Avoid redundant navigation to the same route
+    // Avoid redundant navigation to the same route.
     if (!current.startsWith(target)) {
       context.go(target);
+    }
+
+    // Always update duty cycle on tab tap — idempotent and cheap.
+    _applyDutyCycleForTab(index);
+  }
+
+  /// Set the BLE scan duty cycle appropriate for the given tab index.
+  ///
+  /// Tabs 0 (Attendance), 1 (Social), 2 (SOS) are active communication lanes.
+  /// They need session duty cycle (500ms/500ms, ~50% scan overlap) for reliable
+  /// BLE packet exchange.
+  ///
+  /// Tab 3 (Profile) is passive. Revert to idle (1s/30s, ~3%) to conserve
+  /// battery — no BLE mesh communication happens on this tab.
+  ///
+  /// SAFETY RULE: Never downgrade from SOS mode. If the user triggered an SOS
+  /// and then taps Profile, the emergency duty cycle must be preserved. Only
+  /// downgrade from activeSession → idle, never from sosMode.
+  ///
+  /// This is called both on tab tap AND on shell initState so the duty cycle
+  /// is correct from the first frame, regardless of which screen triggers BLE.
+  void _applyDutyCycleForTab(int index) {
+    final bleState = ref.read(bleStateProvider);
+    final notifier = ref.read(bleStateProvider.notifier);
+
+    // Index 0 = Attendance, 1 = Social, 2 = SOS — all need active scanning.
+    // Index 3 = Profile — passive.
+    final isActiveLane = index < 3;
+
+    if (isActiveLane) {
+      // Boost if currently in idle. Never downgrade from activeSession or sosMode.
+      if (bleState.mode == MeshMode.idle) {
+        notifier.startSession().ignore();
+      }
+    } else {
+      // Profile tab — revert from session to idle, but NEVER from sosMode.
+      if (bleState.mode == MeshMode.activeSession) {
+        notifier.startIdle().ignore();
+      }
     }
   }
 

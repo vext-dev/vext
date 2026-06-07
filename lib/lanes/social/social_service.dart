@@ -35,7 +35,9 @@
 
 import 'dart:async';
 
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:drift/drift.dart' show Value;
+import 'package:flutter/foundation.dart';
 import 'package:uuid/uuid.dart';
 
 import '../../core/app_constants.dart';
@@ -50,21 +52,29 @@ class SocialService {
     required AppDatabase db,
     required FirebaseSyncEngine syncEngine,
     required String currentUserUid,
+    FirebaseFirestore? firestore,
   })  : _mesh = mesh,
         _db = db,
         _syncEngine = syncEngine,
-        _currentUserUid = currentUserUid;
+        _currentUserUid = currentUserUid,
+        _firestore = firestore ?? FirebaseFirestore.instance;
 
   final MeshService _mesh;
   final AppDatabase _db;
   final FirebaseSyncEngine _syncEngine;
   final String _currentUserUid;
+  final FirebaseFirestore _firestore;
 
   // ── Dedup ──────────────────────────────────────────────────────────────────
   final Set<String> _processedPacketIds = {};
 
-  // ── Subscription ──────────────────────────────────────────────────────────
+  // ── Subscriptions ──────────────────────────────────────────────────────────
   StreamSubscription<MeshPacket>? _packetSub;
+
+  // Firestore snapshot listener for messages from devices NOT in BLE range.
+  // Subscribes to messages/broadcast/records — the same path that
+  // FirebaseSyncEngine._syncMessages() writes to (threadId = 'broadcast').
+  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _firestoreSub;
 
   // ── Public: live message list ──────────────────────────────────────────────
 
@@ -77,9 +87,31 @@ class SocialService {
 
   // ── Initialise ─────────────────────────────────────────────────────────────
 
-  /// Wire the mesh message stream. Call once after construction.
+  /// Wire the mesh message stream and Firestore receive path.
+  /// Call once after construction.
   void initialize() {
     _packetSub = _mesh.messagePackets.listen(_onMessagePacket);
+
+    // ── Firestore receive path (BUG C4 fix) ──────────────────────────────────
+    // Subscribes to messages from devices NOT currently in BLE range — e.g.
+    // a message sent from another building that reached Firestore via WiFi.
+    // Only messages with a timestamp AFTER service init are fetched so we
+    // don't flood the screen with historical messages on every app start.
+    //
+    // The listener fires for ALL documents in the collection (including our
+    // own outgoing messages that just synced) — _processedPacketIds deduplicates
+    // them so own-messages never appear twice.
+    final since = Timestamp.fromDate(DateTime.now());
+    _firestoreSub = _firestore
+        .collection(AppConstants.fsMessages)
+        .doc('broadcast')
+        .collection(AppConstants.fsRecords)
+        .where('timestamp', isGreaterThanOrEqualTo: since)
+        .orderBy('timestamp', descending: false)
+        .snapshots()
+        .listen(_onFirestoreSnapshot, onError: (e) {
+      debugPrint('[Social] Firestore snapshot error: $e');
+    });
   }
 
   // ── Public API ─────────────────────────────────────────────────────────────
@@ -130,6 +162,7 @@ class SocialService {
 
   Future<void> dispose() async {
     await _packetSub?.cancel();
+    await _firestoreSub?.cancel();
     _processedPacketIds.clear();
   }
 
@@ -162,5 +195,52 @@ class SocialService {
 
     // Sync to Firestore — best-effort backup.
     _syncEngine.syncNow().ignore();
+  }
+
+  /// Handle a Firestore snapshot from the 'broadcast' thread.
+  ///
+  /// Fires for both added and modified documents. We only care about new
+  /// messages (DocumentChangeType.added). The dedup set prevents messages
+  /// already received via BLE mesh from appearing twice.
+  void _onFirestoreSnapshot(QuerySnapshot<Map<String, dynamic>> snapshot) {
+    for (final change in snapshot.docChanges) {
+      if (change.type != DocumentChangeType.added) continue;
+
+      final data = change.doc.data();
+      if (data == null) continue;
+
+      final id = data['id'] as String?;
+      final senderUid = data['senderUid'] as String?;
+      final content = data['contentEncrypted'] as String?;
+      final ttl = (data['ttl'] as num?)?.toInt();
+      final tsRaw = data['timestamp'];
+
+      if (id == null || senderUid == null || content == null ||
+          ttl == null || tsRaw == null) continue;
+
+      // Deduplicate — might have already arrived via BLE mesh.
+      if (_processedPacketIds.contains(id)) continue;
+      _processedPacketIds.add(id);
+
+      // Ignore our own messages echoed back from Firestore.
+      if (senderUid == _currentUserUid) continue;
+
+      final timestamp = tsRaw is Timestamp
+          ? tsRaw.toDate()
+          : DateTime.now();
+
+      debugPrint('[Social] Firestore message from $senderUid');
+
+      _db.upsertMessage(MessageRecordsCompanion(
+        id: Value(id),
+        senderUid: Value(senderUid),
+        contentEncrypted: Value(content),
+        ttl: Value(ttl),
+        timestamp: Value(timestamp),
+        lane: const Value('social'),
+        synced: const Value(true), // Already in Firestore — mark synced.
+        isRead: const Value(false),
+      )).ignore();
+    }
   }
 }

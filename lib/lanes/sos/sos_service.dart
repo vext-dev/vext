@@ -42,6 +42,7 @@
 import 'dart:async';
 
 import 'package:drift/drift.dart' show Value;
+import 'package:flutter/foundation.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:uuid/uuid.dart';
 
@@ -49,6 +50,7 @@ import '../../core/app_constants.dart';
 import '../../core/proto/mesh_packet.dart';
 import '../../services/drift_service.dart';
 import '../../services/firebase_sync_engine.dart';
+import '../../services/mesh_foreground_service.dart';
 import '../../services/mesh_service.dart';
 
 // ── SosStatus ─────────────────────────────────────────────────────────────────
@@ -109,15 +111,25 @@ class SosService {
     required AppDatabase db,
     required FirebaseSyncEngine syncEngine,
     required String currentUserUid,
+    Future<void> Function()? onSosActivated,
+    Future<void> Function()? onSosCancelled,
   })  : _mesh = mesh,
         _db = db,
         _syncEngine = syncEngine,
-        _currentUserUid = currentUserUid;
+        _currentUserUid = currentUserUid,
+        _onSosActivated = onSosActivated,
+        _onSosCancelled = onSosCancelled;
 
   final MeshService _mesh;
   final AppDatabase _db;
   final FirebaseSyncEngine _syncEngine;
   final String _currentUserUid;
+
+  // ── Duty-cycle callbacks (injected by provider — avoids Riverpod ref in service) ─
+  // onSosActivated: called when SOS is triggered → boosts BLE to 100ms/100ms scan.
+  // onSosCancelled: called when SOS is cancelled → reverts BLE to session mode.
+  final Future<void> Function()? _onSosActivated;
+  final Future<void> Function()? _onSosCancelled;
 
   // ── Active SOS state ───────────────────────────────────────────────────────
   String? _activeSosId;
@@ -125,7 +137,14 @@ class SosService {
   MeshPacket? _activeSosPacket;
 
   // ── Dedup set ──────────────────────────────────────────────────────────────
+  // Tracks packet IDs already processed to prevent relay loops. Without a size
+  // cap this grows unboundedly over a long campus day. Each UUID is ~36 bytes;
+  // 500 entries = ~18 KB — negligible, and more than enough to cover a session.
+  // On overflow the oldest entry is evicted (FIFO via a separate insertion-order
+  // list) so dedup still works for the most recent packets.
+  static const _dedupeMaxSize = 500;
   final Set<String> _processedPacketIds = {};
+  final List<String> _processedPacketOrder = []; // tracks insertion order for eviction
 
   // ── Stream controllers ─────────────────────────────────────────────────────
   final _statusController = StreamController<SosStatus>.broadcast();
@@ -201,7 +220,7 @@ class SosService {
       ttl: AppConstants.ttlSos,
     );
     _activeSosPacket = packet;
-    _processedPacketIds.add(sosId); // don't echo our own SOS back to UI
+    _markProcessed(sosId); // don't echo our own SOS back to UI
 
     // ── Send immediately ────────────────────────────────────────────────────
     await _mesh.sendPacket(packet);
@@ -219,6 +238,19 @@ class SosService {
 
     // ── Sync to Firestore — triggers handleSOSAlert Cloud Function ──────────
     _syncEngine.syncNow().ignore();
+
+    // ── Boost BLE to SOS duty cycle (100ms/100ms) ───────────────────────────
+    // Critical: mesh relay speed is 5x faster in SOS mode. Called via injected
+    // callback so SosService has no dependency on Riverpod or BleStateNotifier.
+    _onSosActivated?.call().ignore();
+
+    // ── Re-assert foreground service priority (Fix 5A) ───────────────────────
+    // On Samsung One UI and Xiaomi MIUI, the OS may silently demote the
+    // foreground service notification when the user navigates to another app
+    // mid-SOS. boostForSos() re-calls setAsForegroundService() in the
+    // background isolate and switches the notification to high-visibility
+    // SOS mode. Safe to call when the service is not running (no-op).
+    MeshForegroundService.boostForSos();
 
     // ── Re-broadcast timer (originating device only) ────────────────────────
     _rebroadcastTimer = Timer.periodic(
@@ -243,6 +275,10 @@ class SosService {
     _rebroadcastTimer = null;
     _activeSosId = null;
     _activeSosPacket = null;
+    // Revert BLE from SOS mode back to session duty cycle.
+    _onSosCancelled?.call().ignore();
+    // Revert foreground notification back to standard mesh status (Fix 5A).
+    MeshForegroundService.revertFromSos();
     _statusController.add(const SosStatus.idle());
   }
 
@@ -254,9 +290,22 @@ class SosService {
     _statusController.close();
     _incomingController.close();
     _processedPacketIds.clear();
+    _processedPacketOrder.clear();
   }
 
   // ── Private ────────────────────────────────────────────────────────────────
+
+  /// Mark [id] as processed, evicting the oldest entry when the cap is reached.
+  void _markProcessed(String id) {
+    if (_processedPacketIds.contains(id)) return;
+    if (_processedPacketIds.length >= _dedupeMaxSize) {
+      // Evict oldest — FIFO via insertion-order list.
+      final oldest = _processedPacketOrder.removeAt(0);
+      _processedPacketIds.remove(oldest);
+    }
+    _processedPacketIds.add(id);
+    _processedPacketOrder.add(id);
+  }
 
   /// Re-send the active SOS packet (originating device only).
   void _rebroadcast() {
@@ -272,14 +321,15 @@ class SosService {
 
     // Deduplicate — mesh relay may deliver the same SOS multiple times.
     if (_processedPacketIds.contains(packet.id)) return;
-    _processedPacketIds.add(packet.id);
+    _markProcessed(packet.id);
 
     final coords = packet.decodeSosPayload();
     final lat = coords?.latitude ?? 0.0;
     final lng = coords?.longitude ?? 0.0;
     final now = DateTime.now();
 
-    // Persist locally.
+    // Persist locally — use catchError so a DB failure doesn't silently swallow
+    // the error and block the UI notification from appearing.
     _db.upsertSosRecord(SosRecordsCompanion(
       id: Value(packet.id),
       senderUid: Value(packet.senderUid),
@@ -288,7 +338,11 @@ class SosService {
       ttl: Value(packet.ttl),
       timestamp: Value(now),
       synced: const Value(false),
-    )).ignore();
+    )).catchError((e) {
+      // Non-fatal: if DB write fails, we still notify UI and attempt Firestore sync.
+      // The packet will be retried if Firestore sync picks it up from another relay.
+      debugPrint('[SOS] Failed to persist incoming SOS locally: $e');
+    });
 
     // Sync to Firestore — triggers FCM Cloud Function for security nodes.
     _syncEngine.syncNow().ignore();

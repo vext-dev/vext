@@ -50,12 +50,16 @@ service cloud.firestore {
     }
 
     // ── users/{uid} ───────────────────────────────────────────────────────────
-    // Owner can read and write their own profile.
-    // Nobody else can read another user's profile doc (prevents uid enumeration).
+    // Any authenticated user can read any profile (needed for name lookups in
+    // teacher attendance proof list and social chat).
+    // Only the owner can write their own profile doc.
+    // NOTE: This exposes name, email, institution_id, public_key to all users —
+    // acceptable for academic demo; tighten to a public_profile sub-collection
+    // before production.
     // Exception: the handleSOSAlert Cloud Function runs as Admin SDK and bypasses
     // all rules — it can still query users for FCM tokens.
     match /users/{uid} {
-      allow read:  if isAuthenticated() && isOwner(uid);
+      allow read:  if isAuthenticated();
       allow write: if isAuthenticated() && isOwner(uid);
     }
 

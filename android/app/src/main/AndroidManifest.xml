@@ -60,6 +60,16 @@
     <uses-permission android:name="android.permission.VIBRATE" />
     <!-- Keep CPU running while BLE scanning in background (Doze bypass) -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Schedule exact alarms that fire even in deep Doze mode (Fix 1B).
+         USE_EXACT_ALARM: auto-granted for safety/communication apps on API 33+.
+         SCHEDULE_EXACT_ALARM: user-approval variant on API 31-32; we fall back
+         to setAndAllowWhileIdle (inexact but Doze-exempt) if not granted. -->
+    <uses-permission
+        android:name="android.permission.USE_EXACT_ALARM"
+        tools:targetApi="33" />
+    <uses-permission
+        android:name="android.permission.SCHEDULE_EXACT_ALARM"
+        tools:targetApi="31" />
     <!-- POST_NOTIFICATIONS: required on Android 13+ to show FCM / SOS banners -->
     <uses-permission
         android:name="android.permission.POST_NOTIFICATIONS"
@@ -95,16 +105,41 @@
             </intent-filter>
         </activity>
 
-        <!-- ── NOTE: Plugin-managed services are intentionally NOT declared here.
-             flutter_background_service registers BackgroundService in its own
-             AndroidManifest (android:exported="true"). firebase_messaging registers
-             FirebaseMessagingService in its own manifest. Re-declaring either here
-             causes a manifest merger conflict on android:exported.
-             ──
-             When the VEXT BLE mesh foreground service is written in Milestone 2,
-             add a <service> entry for OUR class (e.g. VextMeshService), NOT
-             for plugin-owned classes.
+        <!-- ── flutter_background_service foreground type override ──────────────
+             The plugin declares BackgroundService in its own AndroidManifest
+             without a foregroundServiceType attribute. On Android 14 (API 34+)
+             with targetSdk 34+, calling startForeground() without a declared
+             type throws a ForegroundServiceTypeNotAllowedException and crashes
+             the app on screen-off.
+
+             tools:node="merge" merges our attributes onto the plugin's existing
+             <service> declaration instead of re-declaring it (which would cause
+             a "duplicate service" manifest merger conflict on android:exported).
+
+             connectedDevice covers BLE GATT connections, HFP, and A2DP — the
+             correct type for a BLE mesh foreground service.
+
+             FOREGROUND_SERVICE_CONNECTED_DEVICE permission is already declared
+             above in the <uses-permission> block.
              ──────────────────────────────────────────────────────────────── -->
+        <service
+            android:name="id.flutter.flutter_background_service.BackgroundService"
+            android:foregroundServiceType="connectedDevice"
+            tools:node="merge" />
+
+        <!-- ── VextAlarmReceiver — deep-Doze BLE scan restarter (Fix 1B) ─────────
+             Receives the setExactAndAllowWhileIdle alarm and pushes a
+             "scanRestart" event to BleTransportLayer via the alarm_events
+             EventChannel. android:exported="false" — only the system AlarmManager
+             (which has implicit access) needs to broadcast to this receiver.
+             ──────────────────────────────────────────────────────────────── -->
+        <receiver
+            android:name=".VextAlarmReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.example.vext.DOZE_SCAN_RESTART" />
+            </intent-filter>
+        </receiver>
 
         <!-- Flutter tool meta-data — do not delete -->
         <meta-data

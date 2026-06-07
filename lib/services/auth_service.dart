@@ -2,6 +2,8 @@ import 'dart:async';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:flutter/foundation.dart';
 
 import '../core/app_constants.dart';
 
@@ -81,6 +83,9 @@ class AuthService {
   Stream<VextUser?>? _authStateChangesCache;
   StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? _firestoreSub;
 
+  // FCM token refresh subscription — kept alive for the duration of the session.
+  StreamSubscription<String>? _fcmTokenRefreshSub;
+
   /// Emits [VextUser] when logged in, null when logged out.
   ///
   /// Implements SWITCHMAP semantics over Firebase Auth + Firestore snapshots:
@@ -124,6 +129,11 @@ class AuthService {
           controller.add(null);
           return;
         }
+
+        // Save/refresh the FCM token every time a user session is active.
+        // Covers both fresh sign-in and app restarts with a persisted session.
+        // Fire-and-forget: FCM failure must never block the auth state stream.
+        saveFcmToken(firebaseUser.uid).ignore();
 
         // User signed in — open a real-time Firestore listener on the user document.
         // Emits on every document change (role update, key upload, etc.) so the
@@ -174,11 +184,26 @@ class AuthService {
   /// The Firestore document is written with [role: ''] (empty string) so that
   /// the router correctly routes this user to [RoleSelectionScreen]. Role is
   /// set by a subsequent call to [updateRole()] from [RoleSelectionScreen].
+  /// Returns true if [email] belongs to an allowed institution domain.
+  /// Only @bmsce.ac.in addresses are permitted in this deployment.
+  static bool isAllowedDomain(String email) {
+    return email.trim().toLowerCase().endsWith('@bmsce.ac.in');
+  }
+
   Future<VextUser> signUpWithEmail({
     required String email,
     required String password,
     required String name,
   }) async {
+    // ── Domain restriction ─────────────────────────────────────────────────
+    // Only BMSCE institutional email addresses are allowed.
+    if (!isAllowedDomain(email)) {
+      throw FirebaseAuthException(
+        code: 'invalid-email',
+        message: 'Only @bmsce.ac.in email addresses are allowed.',
+      );
+    }
+
     final credential = await _auth.createUserWithEmailAndPassword(
       email: email,
       password: password,
@@ -213,6 +238,14 @@ class AuthService {
     required String email,
     required String password,
   }) async {
+    // ── Domain restriction ─────────────────────────────────────────────────
+    if (!isAllowedDomain(email)) {
+      throw FirebaseAuthException(
+        code: 'invalid-email',
+        message: 'Only @bmsce.ac.in email addresses are allowed.',
+      );
+    }
+
     final credential = await _auth.signInWithEmailAndPassword(
       email: email,
       password: password,
@@ -245,16 +278,106 @@ class AuthService {
   // ── Update Role ────────────────────────────────────────────────────────────
 
   /// Called after role selection screen to persist chosen role.
+  ///
+  /// Uses set(merge:true) instead of update():
+  ///   - update() throws NOT_FOUND if the user doc was never written (network
+  ///     failure during signup). set(merge:true) creates or updates safely.
+  ///
+  /// Awaits waitForPendingWrites() before returning:
+  ///   - Firestore security rules (callerRole()) ALWAYS evaluate against SERVER
+  ///     data, not local cache. If this method returned before the write reached
+  ///     the server, the caller could immediately try a role-guarded operation
+  ///     (e.g. creating a session as teacher) and get permission-denied because
+  ///     the server still has the old role value.
+  ///   - 10-second timeout: if offline, we proceed anyway; the write will sync
+  ///     when connectivity is restored.
   Future<void> updateRole(String uid, String role) async {
     await _firestore
         .collection(AppConstants.fsUsers)
         .doc(uid)
-        .update({'role': role});
+        .set({'role': role}, SetOptions(merge: true));
+
+    // Ensure the role reaches the server before returning.
+    await _firestore.waitForPendingWrites().timeout(
+      const Duration(seconds: 10),
+      onTimeout: () {
+        // Offline — proceed. Role-guarded operations may fail until sync completes,
+        // but that's correct behaviour (security rules are server-side).
+        debugPrint('[Auth] waitForPendingWrites timed out — device may be offline');
+      },
+    );
+  }
+
+  // ── FCM Token ─────────────────────────────────────────────────────────────
+
+  /// Fetch the current FCM registration token and save it to Firestore.
+  ///
+  /// The handleSOSAlert Cloud Function queries users/{uid}.fcmToken to find
+  /// security-role devices to push to. Without this field populated, no SOS
+  /// push notification ever fires.
+  ///
+  /// Also subscribes to FirebaseMessaging.onTokenRefresh so the field stays
+  /// current if FCM rotates the token (happens after app reinstall, token
+  /// expiry, or FCM maintenance).
+  ///
+  /// This method is fire-and-forget from the call sites — it must NEVER throw
+  /// or propagate errors, since FCM failure must not block auth or BLE startup.
+  Future<void> saveFcmToken(String uid) async {
+    try {
+      final token = await FirebaseMessaging.instance.getToken();
+      if (token == null) return; // FCM not available (emulator, permission denied)
+
+      await _firestore
+          .collection(AppConstants.fsUsers)
+          .doc(uid)
+          .set({'fcmToken': token}, SetOptions(merge: true));
+
+      // Cancel any previous refresh listener before setting up a new one.
+      // This prevents duplicate listeners if saveFcmToken is called multiple
+      // times (e.g. app restart with persisted session).
+      _fcmTokenRefreshSub?.cancel();
+      _fcmTokenRefreshSub = FirebaseMessaging.instance.onTokenRefresh.listen(
+        (newToken) {
+          _firestore
+              .collection(AppConstants.fsUsers)
+              .doc(uid)
+              .set({'fcmToken': newToken}, SetOptions(merge: true))
+              .ignore();
+        },
+        onError: (e) {
+          debugPrint('[FCM] onTokenRefresh error: $e');
+        },
+      );
+    } catch (e) {
+      // Best-effort — FCM unavailability must never block the app.
+      debugPrint('[FCM] saveFcmToken failed for uid=$uid: $e');
+    }
   }
 
   // ── Sign Out ───────────────────────────────────────────────────────────────
 
   Future<void> signOut() async {
+    // Cancel FCM token refresh listener and delete the token from FCM.
+    // Deleting the token prevents push notifications from arriving after
+    // sign-out (the Cloud Function would otherwise still find this device's
+    // token in Firestore and push to it).
+    _fcmTokenRefreshSub?.cancel();
+    _fcmTokenRefreshSub = null;
+    try {
+      final uid = _auth.currentUser?.uid;
+      if (uid != null) {
+        // Remove fcmToken from Firestore so the Cloud Function doesn't push
+        // to a logged-out device.
+        await _firestore
+            .collection(AppConstants.fsUsers)
+            .doc(uid)
+            .set({'fcmToken': FieldValue.delete()}, SetOptions(merge: true));
+      }
+      await FirebaseMessaging.instance.deleteToken();
+    } catch (e) {
+      debugPrint('[FCM] signOut token cleanup failed: $e');
+    }
+
     // Cancel the Firestore snapshot subscription eagerly before Firebase Auth
     // fires its null event. This is belt-and-suspenders — the _buildAuthStateChanges
     // listener also cancels it, but doing it here guarantees no Firestore reads

@@ -109,6 +109,9 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
       return 'Network error. Please check your connection.';
     } else if (message.contains('user-disabled')) {
       return 'This account has been disabled. Contact support.';
+    } else if (message.contains('invalid-email') ||
+        message.contains('bmsce')) {
+      return 'Only @bmsce.ac.in email addresses are allowed.';
     }
     return 'Something went wrong. Please try again.';
   }

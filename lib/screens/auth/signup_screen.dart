@@ -142,8 +142,8 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
     if (message.contains('email-already-in-use') ||
         message.contains('already registered')) {
       return 'An account with this email already exists.';
-    } else if (message.contains('invalid-email')) {
-      return 'The email address is not valid.';
+    } else if (message.contains('bmsce') || message.contains('invalid-email')) {
+      return 'Only @bmsce.ac.in email addresses are allowed.';
     } else if (message.contains('weak-password')) {
       return 'Password is too weak. Choose a stronger one.';
     } else if (message.contains('network') ||

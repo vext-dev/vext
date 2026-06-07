@@ -315,6 +315,60 @@ class MeshPacket {
     );
   }
 
+  // ── Attendance ACK (Fix 4A) ────────────────────────────────────────────────
+  //
+  // After a student marks attendance via GATT, they send an ACK packet back
+  // to the mesh. The teacher's AttendanceService listens to ackPackets and
+  // writes the proof to its local Drift DB, enabling an offline dashboard.
+  //
+  // ACK payload layout (little-endian):
+  //   1 B   session_id_len
+  //   var   session_id (UTF-8)
+  //   1 B   hmac_len
+  //   var   hmacToken (UTF-8)
+  //   4 B   rssi (int32) — effective RSSI from the student's proof assembly
+
+  /// Build an attendance ACK packet sent by the student after marking present.
+  ///
+  /// [senderUid]  : studentUid — already in the packet header, no need to repeat.
+  /// [sessionId]  : session the student just marked attendance for.
+  /// [hmacToken]  : the HMAC token from the teacher's attendance packet.
+  /// [rssi]       : the effective RSSI recorded in the student's proof.
+  /// [ttl]        : kept short (3) — ACK only needs to reach the teacher node.
+  factory MeshPacket.attendanceAck({
+    required String id,
+    required String senderUid,
+    required String sessionId,
+    required String hmacToken,
+    required int rssi,
+    int ttl = 3,
+  }) {
+    final sessionIdBytes = utf8.encode(sessionId);
+    final hmacBytes = utf8.encode(hmacToken);
+
+    // Payload: 1 (session_id_len) + sessionIdLen + 1 (hmac_len) + hmacLen + 4 (rssi)
+    final buf = ByteData(2 + sessionIdBytes.length + hmacBytes.length + 4);
+    int offset = 0;
+    buf.setUint8(offset++, sessionIdBytes.length);
+    for (final b in sessionIdBytes) {
+      buf.setUint8(offset++, b);
+    }
+    buf.setUint8(offset++, hmacBytes.length);
+    for (final b in hmacBytes) {
+      buf.setUint8(offset++, b);
+    }
+    buf.setInt32(offset, rssi, Endian.little);
+
+    return MeshPacket(
+      id: id,
+      type: PacketType.ack,
+      ttl: ttl,
+      senderUid: senderUid,
+      timestamp: DateTime.now(),
+      payload: buf.buffer.asUint8List().toList(),
+    );
+  }
+
   // ── Payload decoders ───────────────────────────────────────────────────────
 
   /// Extract sessionId and hmacToken from an attendance packet's payload.
@@ -356,6 +410,34 @@ class MeshPacket {
         latitude: buf.getFloat64(0, Endian.little),
         longitude: buf.getFloat64(8, Endian.little),
       );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Extract sessionId, hmacToken, and rssi from an attendanceAck payload.
+  ///
+  /// Returns null if the packet is not an ACK or the payload is malformed.
+  /// Used by the teacher's AttendanceService to build a local Drift proof.
+  ({String sessionId, String hmacToken, int rssi})? decodeAttendanceAckPayload() {
+    if (type != PacketType.ack || payload.isEmpty) return null;
+    try {
+      final data = Uint8List.fromList(payload);
+      final buf = ByteData.sublistView(data);
+      int offset = 0;
+
+      final sessionLen = buf.getUint8(offset++);
+      if (offset + sessionLen > data.length) return null;
+      final sessionId = utf8.decode(data.sublist(offset, offset + sessionLen));
+      offset += sessionLen;
+
+      final hmacLen = buf.getUint8(offset++);
+      if (offset + hmacLen + 4 > data.length) return null;
+      final hmacToken = utf8.decode(data.sublist(offset, offset + hmacLen));
+      offset += hmacLen;
+
+      final rssi = buf.getInt32(offset, Endian.little);
+      return (sessionId: sessionId, hmacToken: hmacToken, rssi: rssi);
     } catch (_) {
       return null;
     }

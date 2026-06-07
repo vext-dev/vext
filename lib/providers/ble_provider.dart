@@ -15,6 +15,7 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../services/ble_transport_layer.dart';
+import '../services/mesh_foreground_service.dart';
 
 // ── MeshMode enum ─────────────────────────────────────────────────────────────
 
@@ -69,6 +70,9 @@ class BleStateNotifier extends StateNotifier<BleState> {
     // Wire transport callbacks → state updates.
     _transport.onPeerCountChanged = (count) {
       state = state.copyWith(peerCount: count);
+      // Keep the persistent foreground notification in sync with peer count.
+      // Safe to call even when the service is not running — no-op in that case.
+      MeshForegroundService.updateNotification(count);
     };
 
     // Advertising state: fires after every startAdvertising() attempt.
@@ -89,23 +93,29 @@ class BleStateNotifier extends StateNotifier<BleState> {
   Future<void> startIdle() async {
     await _transport.start(mode: ScanDutyMode.idle);
     state = state.copyWith(isActive: true, mode: MeshMode.idle);
+    // Start the foreground service so the process survives screen-off.
+    MeshForegroundService.start().ignore();
   }
 
   /// Session duty cycle (50%). Use when attendance or social screen is active.
   Future<void> startSession() async {
     await _transport.start(mode: ScanDutyMode.session);
     state = state.copyWith(isActive: true, mode: MeshMode.activeSession);
+    MeshForegroundService.start().ignore();
   }
 
   /// SOS duty cycle (near-continuous). Use when SOS is triggered.
   Future<void> startSos() async {
     await _transport.start(mode: ScanDutyMode.sos);
     state = state.copyWith(isActive: true, mode: MeshMode.sosMode);
+    MeshForegroundService.start().ignore();
   }
 
   /// Stop scanning and advertising. Resets to idle UI state.
   Future<void> stopScanning() async {
     await _transport.stop();
+    // Stop the foreground service — mesh is off, notification no longer needed.
+    MeshForegroundService.stop().ignore();
     state = state.copyWith(
       isActive: false,
       mode: MeshMode.idle,
