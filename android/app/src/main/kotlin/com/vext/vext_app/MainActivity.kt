@@ -1,4 +1,4 @@
-package com.example.vext
+package com.vext.vext_app
 
 // ── MainActivity — Flutter entry point + platform channel registration ─────────
 //
@@ -8,22 +8,22 @@ package com.example.vext
 // FlutterActivity handles it automatically.
 //
 // Channels registered here:
-//   BleAdvertiser MethodChannel  "com.example.vext/ble_advertiser"
+//   BleAdvertiser MethodChannel  "com.vext.vext_app/ble_advertiser"
 //     → BLE peripheral advertising (startAdvertising / stopAdvertising)
 //
-//   VextGattServer MethodChannel "com.example.vext/gatt_server"
+//   VextGattServer MethodChannel "com.vext.vext_app/gatt_server"
 //     → GATT server lifecycle (startServer / stopServer)
 //
-//   VextGattServer EventChannel  "com.example.vext/gatt_packets"
+//   VextGattServer EventChannel  "com.vext.vext_app/gatt_packets"
 //     → Stream of incoming packet bytes from GATT client writes
 //
-//   WakeLock MethodChannel       "com.example.vext/wake_lock"
+//   WakeLock MethodChannel       "com.vext.vext_app/wake_lock"
 //     → PARTIAL_WAKE_LOCK acquire/release (Fix 1A)
 //
-//   AlarmManager MethodChannel   "com.example.vext/alarm_manager"
+//   AlarmManager MethodChannel   "com.vext.vext_app/alarm_manager"
 //     → setExactAndAllowWhileIdle scheduling for deep-Doze survival (Fix 1B)
 //
-//   Alarm Events EventChannel    "com.example.vext/alarm_events"
+//   Alarm Events EventChannel    "com.vext.vext_app/alarm_events"
 //     → Stream of "scanRestart" strings fired by VextAlarmReceiver (Fix 1B)
 //
 // ──────────────────────────────────────────────────────────────────────────────
@@ -144,7 +144,7 @@ class MainActivity : FlutterActivity() {
 
         // ── WakeLock channel ───────────────────────────────────────────────────
         // Called by BleTransportLayer.start() / stop() in Dart.
-        MethodChannel(messenger, "com.example.vext/wake_lock")
+        MethodChannel(messenger, "com.vext.vext_app/wake_lock")
             .setMethodCallHandler { call, result ->
                 when (call.method) {
                     "acquireWakeLock" -> { acquireVextWakeLock(); result.success(true) }
@@ -165,7 +165,7 @@ class MainActivity : FlutterActivity() {
         //
         // Falls back to setAndAllowWhileIdle (inexact, still Doze-exempt) on
         // Android 12+ if the user has not granted SCHEDULE_EXACT_ALARM.
-        MethodChannel(messenger, "com.example.vext/alarm_manager")
+        MethodChannel(messenger, "com.vext.vext_app/alarm_manager")
             .setMethodCallHandler { call, result ->
                 when (call.method) {
                     "scheduleDozeAlarm" -> {
@@ -187,7 +187,7 @@ class MainActivity : FlutterActivity() {
         // Dart subscribes when BLE starts. When VextAlarmReceiver fires, it calls
         // eventSink.success("scanRestart"), which this channel delivers to Dart.
         // BleTransportLayer listens and calls _restartDutyCycle() on each event.
-        EventChannel(messenger, "com.example.vext/alarm_events")
+        EventChannel(messenger, "com.vext.vext_app/alarm_events")
             .setStreamHandler(object : EventChannel.StreamHandler {
                 override fun onListen(arguments: Any?, events: EventChannel.EventSink) {
                     VextAlarmReceiver.eventSink = events

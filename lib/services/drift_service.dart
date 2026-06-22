@@ -52,16 +52,76 @@ class AppDatabase extends _$AppDatabase {
   }
 
   @override
-  int get schemaVersion => 1;
+  int get schemaVersion => 2;
 
   // ── Migration ────────────────────────────────────────────────────────────────
-  // v1: initial schema — no migrations needed yet.
-  // When adding columns in future milestones, bump schemaVersion and add a
-  // MigrationStrategy here. Never rename/drop columns in production without
-  // a migration.
+  //
+  // v1 → v2: Added UNIQUE(session_id, student_uid) to attendance_proofs.
+  //
+  // SQLite cannot add a UNIQUE constraint to an existing column via
+  // ALTER TABLE — the table must be recreated. Drift's m.recreateTable()
+  // handles this: it creates a temp table with the new schema, copies all
+  // rows, drops the old table, then renames the temp table.
+  //
+  // Before recreating, we deduplicate existing rows by keeping only the
+  // most recently inserted row (highest rowid) per (session_id, student_uid)
+  // pair. This is safe: the most recent row is the most complete proof.
+  //
+  // Never rename or drop columns without a migration. Bump schemaVersion
+  // for every structural change and add a corresponding onUpgrade branch.
   @override
   MigrationStrategy get migration => MigrationStrategy(
         onCreate: (m) => m.createAll(),
+        onUpgrade: (m, from, to) async {
+          if (from < 2) {
+            // v1 → v2: Add UNIQUE(session_id, student_uid) to attendance_proofs.
+            //
+            // m.recreateTable() does not exist in Drift 2.21 — use raw SQLite
+            // to manually recreate the table (SQLite cannot ALTER TABLE ADD UNIQUE).
+            //
+            // Step 1: Deduplicate existing rows (keep most-recently inserted per pair).
+            await customStatement('''
+              DELETE FROM attendance_proofs
+              WHERE rowid NOT IN (
+                SELECT MAX(rowid)
+                FROM attendance_proofs
+                GROUP BY session_id, student_uid
+              )
+            ''');
+
+            // Step 2: Create a new table with the UNIQUE constraint.
+            // Column types match what Drift generates from the AttendanceProofs schema.
+            await customStatement('''
+              CREATE TABLE IF NOT EXISTS attendance_proofs_new (
+                "id"          TEXT NOT NULL PRIMARY KEY,
+                "session_id"  TEXT NOT NULL,
+                "student_uid" TEXT NOT NULL,
+                "hmac_token"  TEXT NOT NULL,
+                "rssi"        INTEGER NOT NULL,
+                "timestamp"   INTEGER NOT NULL,
+                "gps_lat"     REAL,
+                "gps_lng"     REAL,
+                "synced"      INTEGER NOT NULL DEFAULT 0
+                                CHECK ("synced" IN (0, 1)),
+                UNIQUE ("session_id", "student_uid")
+              )
+            ''');
+
+            // Step 3: Copy the clean (deduplicated) rows into the new table.
+            await customStatement('''
+              INSERT OR IGNORE INTO attendance_proofs_new
+                SELECT id, session_id, student_uid, hmac_token,
+                       rssi, timestamp, gps_lat, gps_lng, synced
+                FROM attendance_proofs
+            ''');
+
+            // Step 4: Swap tables.
+            await customStatement('DROP TABLE attendance_proofs');
+            await customStatement(
+              'ALTER TABLE attendance_proofs_new RENAME TO attendance_proofs',
+            );
+          }
+        },
       );
 
   // ────────────────────────────────────────────────────────────────────────────
@@ -231,7 +291,12 @@ class AppDatabase extends _$AppDatabase {
   // Maintenance: call from a periodic timer in MeshService (Milestone 3)
   // ────────────────────────────────────────────────────────────────────────────
 
-  /// Single call to run all purge operations. Intended to be called every hour.
+  /// Single call to run all purge operations. Called every 30 minutes by
+  /// MeshService's maintenance timer — running more frequently than the purge
+  /// cutoffs (60 min for SeenPackets, 30 days for messages, 7 days for peers)
+  /// is intentional: the extra calls are no-ops when no rows are old enough
+  /// to evict, and the 30-minute cadence ensures the DB stays lean throughout
+  /// a full campus day without waiting a full hour between passes.
   Future<void> runMaintenance() async {
     final now = DateTime.now();
     await purgeOldSeenPackets(now.subtract(const Duration(minutes: 60)));

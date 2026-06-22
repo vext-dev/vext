@@ -27,6 +27,7 @@
 //
 // ──────────────────────────────────────────────────────────────────────────────
 
+import 'dart:async';   // Completer — used by the TOCTOU init lock
 import 'dart:convert';
 import 'dart:typed_data';
 
@@ -93,6 +94,9 @@ class CryptoService {
   static final _aesgcm   = AesGcm.with256bits();
   static final _hmacSha256 = Hmac.sha256();
   static final _sha256   = Sha256();
+  // HKDF used to derive the attendance HMAC key from the Ed25519 private key
+  // with domain separation. See _getHmacKey() for rationale.
+  static final _hkdf = Hkdf(hmac: Hmac.sha256(), outputLength: 32);
 
   // ── In-memory keypair cache (loaded once on initialize()) ────────────────
 
@@ -100,14 +104,50 @@ class CryptoService {
   SimpleKeyPair? _ed25519KeyPair;
   String? _fingerprint;
 
+  // ── Initialisation lock (Bug 10 fix) ─────────────────────────────────────
+  //
+  // TOCTOU race: if initialize() is called concurrently (hot-restart during
+  // key generation, or two providers initialising in parallel), each call
+  // runs _loadOrGenerateX25519 / _loadOrGenerateEd25519. Both find no keys
+  // in secure storage (reads happen before any write), both generate fresh
+  // keypairs, and the second write silently overwrites the first. The in-memory
+  // cache holds two different keypairs in the two callers — HMAC tokens generated
+  // on one will fail verification on the other.
+  //
+  // Fix: a Completer-based mutex. The first caller runs the full init sequence.
+  // All subsequent concurrent callers await the same Completer and share the
+  // result. On failure, the Completer is reset so the next call can retry.
+  Completer<void>? _initCompleter;
+
   // ── Initialisation ────────────────────────────────────────────────────────
 
   /// Load existing keypairs from secure storage, or generate them if absent.
-  /// Must be called before any other method.
+  /// Must be called before any other method. Safe to call concurrently —
+  /// only one initialisation runs at a time; subsequent calls await the result.
   Future<void> initialize() async {
-    _x25519KeyPair  = await _loadOrGenerateX25519();
-    _ed25519KeyPair = await _loadOrGenerateEd25519();
-    _fingerprint    = await _computeFingerprint();
+    // Already fully initialised — fast path.
+    if (_fingerprint != null) return;
+
+    // An initialisation is already in progress — wait for it to complete.
+    if (_initCompleter != null) {
+      return _initCompleter!.future;
+    }
+
+    // First caller: run the full init sequence under the lock.
+    _initCompleter = Completer<void>();
+    try {
+      _x25519KeyPair  = await _loadOrGenerateX25519();
+      _ed25519KeyPair = await _loadOrGenerateEd25519();
+      _fingerprint    = await _computeFingerprint();
+      _initCompleter!.complete();
+    } catch (e, st) {
+      // On failure, reset the lock so the next call can retry cleanly.
+      final completer = _initCompleter!;
+      _initCompleter = null;
+      _fingerprint = null; // ensure fast-path check doesn't lie
+      completer.completeError(e, st);
+      rethrow;
+    }
   }
 
   // ── Public key fingerprint ────────────────────────────────────────────────
@@ -328,12 +368,36 @@ class CryptoService {
 
   // ── Private — HMAC key derivation ────────────────────────────────────────
 
-  /// HMAC key: first 32 bytes of the Ed25519 private key.
-  /// Ties the HMAC to teacher identity — students cannot forge it.
+  /// Derive the attendance HMAC key from the Ed25519 private key via HKDF.
+  ///
+  /// Previous bug: the HMAC key was the raw first 32 bytes of the Ed25519
+  /// private key — the SAME key material used for signing. This is a key
+  /// reuse anti-pattern: feeding the same bytes into two different algorithms
+  /// (Ed25519 sign and HMAC-SHA256) can enable cross-protocol attacks when
+  /// one algorithm's output leaks information about the other.
+  ///
+  /// Fix: HKDF (HMAC-based Key Derivation Function, RFC 5869) derives a
+  /// cryptographically independent key from the same secret, using a domain
+  /// separation label ("VEXT-HMAC-ATTENDANCE-v1") to ensure the derived key
+  /// is unrelated to any other key derived from the same source material.
+  ///
+  /// The derived key is deterministic: same Ed25519 private key + same label
+  /// always produces the same 32-byte HMAC key, so teacher tokens are stable
+  /// across app restarts without storing an extra secret.
+  ///
+  /// NOTE: This changes the HMAC key from the previous raw-bytes derivation.
+  /// Any tokens generated before this change will fail verification — this is
+  /// acceptable because attendance sessions are ephemeral (max 90 seconds per
+  /// token window). Old tokens from before the update simply expire naturally.
   Future<SecretKey> _getHmacKey() async {
     final kp  = _assertEd25519();
     final prv = await kp.extractPrivateKeyBytes();
-    return SecretKey(prv.take(32).toList());
+
+    return _hkdf.deriveKey(
+      secretKey: SecretKey(prv),
+      nonce: const <int>[], // empty nonce: the private key itself is the secret
+      info: utf8.encode('VEXT-HMAC-ATTENDANCE-v1'),
+    );
   }
 
   // ── Private — ECDH shared secret ─────────────────────────────────────────

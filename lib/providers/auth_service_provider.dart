@@ -5,8 +5,16 @@ import '../services/auth_service.dart';
 
 /// Singleton provider for [AuthService].
 /// All widgets that need auth operations read this.
+///
+/// ref.onDispose cancels the Firebase Auth and Firestore subscriptions
+/// inside AuthService when the ProviderScope is disposed (test teardown,
+/// app exit). In production the scope lives for the app lifetime, so
+/// dispose() is rarely called — but it keeps tests hermetic and prevents
+/// resource warnings in strict analysis modes.
 final authServiceProvider = Provider<AuthService>((ref) {
-  return AuthService();
+  final service = AuthService();
+  ref.onDispose(() => service.dispose().ignore());
+  return service;
 });
 
 /// Stream provider for the current authenticated [VextUser].

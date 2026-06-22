@@ -1,4 +1,4 @@
-package com.example.vext
+package com.vext.vext_app
 
 // ── BleAdvertiser — Kotlin BLE Peripheral Advertising ─────────────────────────
 //
@@ -6,7 +6,7 @@ package com.example.vext
 // requires Android's BluetoothLeAdvertiser API, exposed to Flutter via a
 // MethodChannel.
 //
-// Channel: "com.example.vext/ble_advertiser"
+// Channel: "com.vext.vext_app/ble_advertiser"
 // Methods:
 //   startAdvertising(payload: ByteArray?) → Boolean
 //     Starts BLE advertising with the VEXT service UUID.
@@ -42,7 +42,7 @@ import io.flutter.plugin.common.MethodChannel.Result
 class BleAdvertiser(private val context: Context) : MethodCallHandler {
 
     companion object {
-        const val CHANNEL_NAME = "com.example.vext/ble_advertiser"
+        const val CHANNEL_NAME = "com.vext.vext_app/ble_advertiser"
 
         // VEXT primary service UUID — must match AppConstants.bleServiceUuid in Dart.
         private val VEXT_SERVICE_UUID =

@@ -1,4 +1,4 @@
-package com.example.vext
+package com.vext.vext_app
 
 // ── VextAlarmReceiver — AlarmManager deep-Doze BLE scan restarter ──────────────
 //
@@ -40,7 +40,7 @@ class VextAlarmReceiver : BroadcastReceiver() {
 
     companion object {
         /// Broadcast action string — must match the Intent created in MainActivity.
-        const val ACTION = "com.example.vext.DOZE_SCAN_RESTART"
+        const val ACTION = "com.vext.vext_app.DOZE_SCAN_RESTART"
 
         /// PendingIntent request code — arbitrary, but must be unique per alarm.
         const val REQUEST_CODE = 0xBEEF

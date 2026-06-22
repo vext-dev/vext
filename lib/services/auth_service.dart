@@ -40,6 +40,9 @@ class VextUser {
     );
   }
 
+  /// Core user fields — used for Firestore reads/writes that UPDATE an existing
+  /// document (role change, key upload, etc.). Does NOT include [created_at]
+  /// so re-writes never overwrite the original creation timestamp.
   Map<String, dynamic> toMap() => {
         'uid': uid,
         'email': email,
@@ -47,7 +50,24 @@ class VextUser {
         'role': role,
         'institution_id': institutionId,
         'public_key': publicKeyFingerprint,
-        'created_at': FieldValue.serverTimestamp(),
+      };
+
+  /// Full document map for INITIAL document creation only.
+  ///
+  /// Includes [created_at] as a server timestamp — call this ONCE when first
+  /// writing the user document (signup, or self-healing write on sign-in when
+  /// the document is missing). Never use this for updates to existing documents.
+  ///
+  /// [knownCreationTime]: pass [FirebaseAuth.User.metadata.creationTime] when
+  /// available so the field reflects the true Firebase Auth account creation
+  /// time even if Firestore was unreachable during signup. Falls back to
+  /// [FieldValue.serverTimestamp()] (current time) only when the Auth metadata
+  /// is null (e.g. legacy accounts or emulator quirks).
+  Map<String, dynamic> toInitialMap({DateTime? knownCreationTime}) => {
+        ...toMap(),
+        'created_at': knownCreationTime != null
+            ? Timestamp.fromDate(knownCreationTime)
+            : FieldValue.serverTimestamp(),
       };
 
   VextUser copyWith({String? role, String? publicKeyFingerprint}) {
@@ -77,11 +97,20 @@ class AuthService {
 
   // ── Auth State Stream ──────────────────────────────────────────────────────
 
-  // Cached stream and its active Firestore subscription — lazily initialised.
-  // Using a single cached stream ensures all watchers (authStateProvider,
-  // _RouterNotifier) share the same underlying subscription chain.
+  // Cached stream — lazily initialised. All watchers share one subscription chain.
   Stream<VextUser?>? _authStateChangesCache;
+
+  // Promoted from local variable in _buildAuthStateChanges() to instance field.
+  // This allows dispose() to close it in test teardown without leaking an
+  // unclosed broadcast StreamController. In production the controller lives for
+  // the app lifetime and is only closed naturally via the Firebase Auth onDone
+  // callback (app destruction). In tests, dispose() can now safely close it.
+  StreamController<VextUser?>? _authBroadcastController;
+
   StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? _firestoreSub;
+
+  // Firebase Auth state subscription — stored for cancellation in dispose().
+  StreamSubscription<User?>? _authSub;
 
   // FCM token refresh subscription — kept alive for the duration of the session.
   StreamSubscription<String>? _fcmTokenRefreshSub;
@@ -107,12 +136,15 @@ class AuthService {
   }
 
   Stream<VextUser?> _buildAuthStateChanges() {
-    // Broadcast controller: multiple Riverpod providers can subscribe
-    // (_RouterNotifier via authStateProvider, etc.) without conflict.
-    final controller = StreamController<VextUser?>.broadcast();
+    // Use the instance field instead of a local variable so dispose() can
+    // close the controller in test teardown without a resource leak.
+    _authBroadcastController = StreamController<VextUser?>.broadcast();
+    final controller = _authBroadcastController!;
 
-    // Subscribe to Firebase Auth. This subscription lives for the app lifetime.
-    _auth.authStateChanges().listen(
+    // Subscribe to Firebase Auth and store the subscription so dispose() can
+    // cancel it. This prevents callbacks from firing into a closed controller
+    // (test teardown, hot-restart) and satisfies resource-management lints.
+    _authSub = _auth.authStateChanges().listen(
       (firebaseUser) {
         // ── SWITCHMAP: cancel the old Firestore listener immediately ──────────
         // This is what asyncExpand DOES NOT do. asyncExpand waits for the inner
@@ -174,6 +206,46 @@ class AuthService {
     return controller.stream;
   }
 
+  /// Cancel all active subscriptions and close the broadcast controller.
+  ///
+  /// Call this when the AuthService is being torn down (test cleanup, or if
+  /// the provider scope is disposed). In production the AuthService lives for
+  /// the app lifetime, so dispose() is rarely needed — but it ensures clean
+  /// teardown in integration tests and prevents "cannot add after close" errors
+  /// on hot-restart in development.
+  Future<void> dispose() async {
+    // Cancel Firebase Auth listener first — stops any in-flight callbacks
+    // from firing into the controller after we close it.
+    await _authSub?.cancel();
+    _authSub = null;
+    _firestoreSub?.cancel();
+    _firestoreSub = null;
+    _fcmTokenRefreshSub?.cancel();
+    _fcmTokenRefreshSub = null;
+
+    // Close the broadcast controller if it is still open.
+    //
+    // Production: the controller is closed naturally by the Firebase Auth
+    // stream's onDone callback (app destruction). Calling close() here
+    // on a production auth teardown (logout) is safe — once _authSub is
+    // cancelled above, no more events will be added, so closing it has no
+    // visible side effect.
+    //
+    // Tests: without this close(), an unclosed StreamController is leaked
+    // every time a test AuthService is created and then discarded, which
+    // triggers resource-warning failures in strict test environments.
+    //
+    // authStateProvider (StreamProvider) handles a stream completion by
+    // transitioning to AsyncData with the last emitted value rather than
+    // AsyncError — so router stability is maintained even when the stream closes.
+    if (_authBroadcastController != null &&
+        !_authBroadcastController!.isClosed) {
+      await _authBroadcastController!.close();
+      _authBroadcastController = null;
+      _authStateChangesCache = null;
+    }
+  }
+
   /// Current user synchronously (null if not signed in).
   User? get currentFirebaseUser => _auth.currentUser;
 
@@ -224,10 +296,16 @@ class AuthService {
       institutionId: 'default',
     );
 
+    // Use toInitialMap() — writes created_at exactly once, on account creation.
+    // This is the ONLY call site that should use toInitialMap(); all subsequent
+    // writes (role update, key upload) use set(merge:true) with toMap() or a
+    // partial map, so created_at is never overwritten.
     await _firestore
         .collection(AppConstants.fsUsers)
         .doc(user.uid)
-        .set(vextUser.toMap());
+        .set(vextUser.toInitialMap(
+          knownCreationTime: user.metadata.creationTime,
+        ));
 
     return vextUser;
   }
@@ -266,10 +344,16 @@ class AuthService {
         role: '',
         institutionId: 'default',
       );
+      // Use toInitialMap() with the Auth account's true creation time so
+      // created_at reflects when the account was CREATED (Firebase Auth
+      // metadata), not when the self-healing write runs. This preserves data
+      // integrity for users whose Firestore doc was lost during signup.
       await _firestore
           .collection(AppConstants.fsUsers)
           .doc(firebaseUser.uid)
-          .set(vextUser.toMap());
+          .set(vextUser.toInitialMap(
+            knownCreationTime: firebaseUser.metadata.creationTime,
+          ));
     }
 
     return vextUser;

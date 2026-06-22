@@ -1,4 +1,4 @@
-package com.example.vext
+package com.vext.vext_app
 
 // ── VextGattServer — Kotlin GATT Server (Peripheral/Server Role) ──────────────
 //
@@ -11,12 +11,12 @@ package com.example.vext
 //                                          ← EventChannel (incoming packets)
 //
 // Channels:
-//   MethodChannel "com.example.vext/gatt_server"
+//   MethodChannel "com.vext.vext_app/gatt_server"
 //     startServer()  → Boolean
 //     stopServer()   → Boolean
 //     isRunning()    → Boolean
 //
-//   EventChannel "com.example.vext/gatt_packets"
+//   EventChannel "com.vext.vext_app/gatt_packets"
 //     Emits List<Int> (packet bytes) whenever a peer writes to the write
 //     characteristic. Dart converts this to Uint8List.
 //
@@ -52,8 +52,8 @@ class VextGattServer(private val context: Context) :
     MethodCallHandler, EventChannel.StreamHandler {
 
     companion object {
-        const val METHOD_CHANNEL_NAME = "com.example.vext/gatt_server"
-        const val EVENT_CHANNEL_NAME  = "com.example.vext/gatt_packets"
+        const val METHOD_CHANNEL_NAME = "com.vext.vext_app/gatt_server"
+        const val EVENT_CHANNEL_NAME  = "com.vext.vext_app/gatt_packets"
 
         // Must match AppConstants in Dart.
         private val SERVICE_UUID        = UUID.fromString("6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
