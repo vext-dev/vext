@@ -19,7 +19,8 @@ rules_version = '2';
 //   sessions/{sessionId}
 //   attendance/{sessionId}/proofs/{studentUid}
 //   sos_events/{sosId}
-//   messages/{threadId}/records/{msgId}
+//   messages/{threadId}/records/{msgId}   ('broadcast' or sorted-UID DM thread)
+//   public_keys/{uid}                     (X25519 directory, Milestone 7 DMs)
 // ─────────────────────────────────────────────────────────────────────────────
 
 service cloud.firestore {
@@ -47,6 +48,20 @@ service cloud.firestore {
 
     function isSecurity() {
       return isAuthenticated() && callerRole() == 'security';
+    }
+
+    // ── Helper: is the caller one of the two participants in a DM thread? ────
+    // threadId is the two participant UIDs sorted lexicographically and
+    // joined with '_' (see FirebaseSyncEngine._syncMessages) — e.g.
+    // 'uidA_uidB'. Guards on parts.size() == 2 before indexing — a threadId
+    // with no '_' (or any shape other than exactly two parts) safely
+    // evaluates to false rather than throwing an out-of-bounds error.
+    // NOTE: this assumes UIDs never contain '_' themselves — true for
+    // Firebase Auth's default UID generation, which this app relies on.
+    function isDmParticipant(threadId) {
+      let parts = threadId.split('_');
+      return parts.size() == 2 &&
+             (parts[0] == request.auth.uid || parts[1] == request.auth.uid);
     }
 
     // ── users/{uid} ───────────────────────────────────────────────────────────
@@ -115,16 +130,40 @@ service cloud.firestore {
     }
 
     // ── messages/{threadId}/records/{msgId} ───────────────────────────────────
-    // Social lane — any authenticated user can read and write messages.
-    // Content is encrypted end-to-end (Box encryption); Firestore stores only
-    // ciphertext. No role restriction needed here — the crypto layer enforces
-    // confidentiality.
-    // threadId is derived from sorted sender+recipient UIDs in FirebaseSyncEngine.
+    // Social lane.
+    // threadId == 'broadcast': the public Lane B group chat — any
+    // authenticated user can read and write, unchanged from the original
+    // design. Content here is plaintext by design (no encryption needed for
+    // a public broadcast).
+    // Any other threadId: a 1:1 direct message thread (Milestone 7),
+    // identified by sorted sender+recipient UIDs joined with '_' (see
+    // FirebaseSyncEngine._syncMessages — this scheme was the ORIGINAL
+    // design's documented intent, not new scope). Only the two participants
+    // may read or create records in that thread. Content is end-to-end
+    // encrypted (X25519 ECDH + AES-256-GCM, CryptoService); Firestore stores
+    // only ciphertext for DM threads, so even a rules bug here would not
+    // expose plaintext — but correct scoping still matters for metadata
+    // (who's messaging whom, timing, frequency).
     match /messages/{threadId}/records/{msgId} {
-      allow read:   if isAuthenticated();
-      allow create: if isAuthenticated();
+      allow read:   if isAuthenticated() &&
+                       (threadId == 'broadcast' || isDmParticipant(threadId));
+      allow create: if isAuthenticated() &&
+                       (threadId == 'broadcast' || isDmParticipant(threadId));
       allow update: if false; // Messages are immutable once sent.
       allow delete: if false;
+    }
+
+    // ── public_keys/{uid} ──────────────────────────────────────────────────────
+    // X25519 public-key directory for Lane B DM encryption (Milestone 7).
+    // Any authenticated user can read any public key — that's the whole
+    // point, peers need this to derive a shared ECDH secret before sending a
+    // DM. Only the owner can write their own key (prevents a malicious user
+    // from overwriting someone else's key to intercept messages meant for
+    // them — a textbook key-substitution attack on unauthenticated key
+    // directories).
+    match /public_keys/{uid} {
+      allow read:  if isAuthenticated();
+      allow write: if isAuthenticated() && isOwner(uid);
     }
 
     // ── Catch-all: deny everything not explicitly matched ─────────────────────

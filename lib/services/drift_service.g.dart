@@ -218,8 +218,14 @@ late final GeneratedColumn<bool> synced = GeneratedColumn<bool>('synced', aliase
 static const VerificationMeta _isReadMeta = const VerificationMeta('isRead');
 @override
 late final GeneratedColumn<bool> isRead = GeneratedColumn<bool>('is_read', aliasedName, false, type: DriftSqlType.bool, requiredDuringInsert: false, defaultConstraints: GeneratedColumn.constraintIsAlways('CHECK ("is_read" IN (0, 1))'), defaultValue: const Constant(false));
+static const VerificationMeta _recipientUidMeta = const VerificationMeta('recipientUid');
 @override
-List<GeneratedColumn> get $columns => [id, senderUid, contentEncrypted, ttl, timestamp, lane, synced, isRead];
+late final GeneratedColumn<String> recipientUid = GeneratedColumn<String>('recipient_uid', aliasedName, true, type: DriftSqlType.string, requiredDuringInsert: false);
+static const VerificationMeta _cipherBlobMeta = const VerificationMeta('cipherBlob');
+@override
+late final GeneratedColumn<String> cipherBlob = GeneratedColumn<String>('cipher_blob', aliasedName, true, type: DriftSqlType.string, requiredDuringInsert: false);
+@override
+List<GeneratedColumn> get $columns => [id, senderUid, contentEncrypted, ttl, timestamp, lane, synced, isRead, recipientUid, cipherBlob];
 @override
 String get aliasedName => _alias ?? actualTableName;
 @override
@@ -252,12 +258,14 @@ context.missing(_timestampMeta);
 if (data.containsKey('lane')) {
 context.handle(_laneMeta, lane.isAcceptableOrUnknown(data['lane']!, _laneMeta));}if (data.containsKey('synced')) {
 context.handle(_syncedMeta, synced.isAcceptableOrUnknown(data['synced']!, _syncedMeta));}if (data.containsKey('is_read')) {
-context.handle(_isReadMeta, isRead.isAcceptableOrUnknown(data['is_read']!, _isReadMeta));}return context;
+context.handle(_isReadMeta, isRead.isAcceptableOrUnknown(data['is_read']!, _isReadMeta));}if (data.containsKey('recipient_uid')) {
+context.handle(_recipientUidMeta, recipientUid.isAcceptableOrUnknown(data['recipient_uid']!, _recipientUidMeta));}if (data.containsKey('cipher_blob')) {
+context.handle(_cipherBlobMeta, cipherBlob.isAcceptableOrUnknown(data['cipher_blob']!, _cipherBlobMeta));}return context;
 }
 @override
 Set<GeneratedColumn> get $primaryKey => {id};
 @override MessageRecord map(Map<String, dynamic> data, {String? tablePrefix})  {
-final effectivePrefix = tablePrefix != null ? '$tablePrefix.' : '';return MessageRecord(id: attachedDatabase.typeMapping.read(DriftSqlType.string, data['${effectivePrefix}id'])!, senderUid: attachedDatabase.typeMapping.read(DriftSqlType.string, data['${effectivePrefix}sender_uid'])!, contentEncrypted: attachedDatabase.typeMapping.read(DriftSqlType.string, data['${effectivePrefix}content_encrypted'])!, ttl: attachedDatabase.typeMapping.read(DriftSqlType.int, data['${effectivePrefix}ttl'])!, timestamp: attachedDatabase.typeMapping.read(DriftSqlType.dateTime, data['${effectivePrefix}timestamp'])!, lane: attachedDatabase.typeMapping.read(DriftSqlType.string, data['${effectivePrefix}lane'])!, synced: attachedDatabase.typeMapping.read(DriftSqlType.bool, data['${effectivePrefix}synced'])!, isRead: attachedDatabase.typeMapping.read(DriftSqlType.bool, data['${effectivePrefix}is_read'])!, );
+final effectivePrefix = tablePrefix != null ? '$tablePrefix.' : '';return MessageRecord(id: attachedDatabase.typeMapping.read(DriftSqlType.string, data['${effectivePrefix}id'])!, senderUid: attachedDatabase.typeMapping.read(DriftSqlType.string, data['${effectivePrefix}sender_uid'])!, contentEncrypted: attachedDatabase.typeMapping.read(DriftSqlType.string, data['${effectivePrefix}content_encrypted'])!, ttl: attachedDatabase.typeMapping.read(DriftSqlType.int, data['${effectivePrefix}ttl'])!, timestamp: attachedDatabase.typeMapping.read(DriftSqlType.dateTime, data['${effectivePrefix}timestamp'])!, lane: attachedDatabase.typeMapping.read(DriftSqlType.string, data['${effectivePrefix}lane'])!, synced: attachedDatabase.typeMapping.read(DriftSqlType.bool, data['${effectivePrefix}synced'])!, isRead: attachedDatabase.typeMapping.read(DriftSqlType.bool, data['${effectivePrefix}is_read'])!, recipientUid: attachedDatabase.typeMapping.read(DriftSqlType.string, data['${effectivePrefix}recipient_uid']), cipherBlob: attachedDatabase.typeMapping.read(DriftSqlType.string, data['${effectivePrefix}cipher_blob']), );
 }
 @override
 $MessageRecordsTable createAlias(String alias) {
@@ -280,7 +288,23 @@ final String lane;
 final bool synced;
 /// Whether the local user has read this message.
 final bool isRead;
-const MessageRecord({required this.id, required this.senderUid, required this.contentEncrypted, required this.ttl, required this.timestamp, required this.lane, required this.synced, required this.isRead});@override
+/// Recipient's Firebase UID — null for broadcast messages (Lane B group
+/// chat, unchanged behaviour). Non-null for a 1:1 direct message
+/// (Milestone 7). watchAllMessages()/allMessages() filter this to null so
+/// DMs never leak into the public broadcast feed.
+final String? recipientUid;
+/// Base64 of EncryptedMessage.toBytes() (nonce+mac+ciphertext) — set only
+/// for direct messages, null for broadcast rows.
+///
+/// contentEncrypted always holds human-readable PLAINTEXT for every row
+/// (broadcast — unencrypted by design — and DM, after this device either
+/// composed or successfully decrypted it). That's what the UI renders
+/// directly with zero decrypt step. cipherBlob exists purely so
+/// FirebaseSyncEngine has the real ciphertext bytes to mirror to Firestore
+/// for DM rows without ever uploading plaintext or re-deriving the
+/// ciphertext at sync time.
+final String? cipherBlob;
+const MessageRecord({required this.id, required this.senderUid, required this.contentEncrypted, required this.ttl, required this.timestamp, required this.lane, required this.synced, required this.isRead, this.recipientUid, this.cipherBlob});@override
 Map<String, Expression> toColumns(bool nullToAbsent) {
 final map = <String, Expression> {};map['id'] = Variable<String>(id);
 map['sender_uid'] = Variable<String>(senderUid);
@@ -290,26 +314,28 @@ map['timestamp'] = Variable<DateTime>(timestamp);
 map['lane'] = Variable<String>(lane);
 map['synced'] = Variable<bool>(synced);
 map['is_read'] = Variable<bool>(isRead);
-return map; 
+if (!nullToAbsent || recipientUid != null){map['recipient_uid'] = Variable<String>(recipientUid);
+}if (!nullToAbsent || cipherBlob != null){map['cipher_blob'] = Variable<String>(cipherBlob);
+}return map; 
 }
 MessageRecordsCompanion toCompanion(bool nullToAbsent) {
-return MessageRecordsCompanion(id: Value(id),senderUid: Value(senderUid),contentEncrypted: Value(contentEncrypted),ttl: Value(ttl),timestamp: Value(timestamp),lane: Value(lane),synced: Value(synced),isRead: Value(isRead),);
+return MessageRecordsCompanion(id: Value(id),senderUid: Value(senderUid),contentEncrypted: Value(contentEncrypted),ttl: Value(ttl),timestamp: Value(timestamp),lane: Value(lane),synced: Value(synced),isRead: Value(isRead),recipientUid: recipientUid == null && nullToAbsent ? const Value.absent() : Value(recipientUid),cipherBlob: cipherBlob == null && nullToAbsent ? const Value.absent() : Value(cipherBlob),);
 }
 factory MessageRecord.fromJson(Map<String, dynamic> json, {ValueSerializer? serializer}) {
 serializer ??= driftRuntimeOptions.defaultSerializer;
-return MessageRecord(id: serializer.fromJson<String>(json['id']),senderUid: serializer.fromJson<String>(json['senderUid']),contentEncrypted: serializer.fromJson<String>(json['contentEncrypted']),ttl: serializer.fromJson<int>(json['ttl']),timestamp: serializer.fromJson<DateTime>(json['timestamp']),lane: serializer.fromJson<String>(json['lane']),synced: serializer.fromJson<bool>(json['synced']),isRead: serializer.fromJson<bool>(json['isRead']),);}
+return MessageRecord(id: serializer.fromJson<String>(json['id']),senderUid: serializer.fromJson<String>(json['senderUid']),contentEncrypted: serializer.fromJson<String>(json['contentEncrypted']),ttl: serializer.fromJson<int>(json['ttl']),timestamp: serializer.fromJson<DateTime>(json['timestamp']),lane: serializer.fromJson<String>(json['lane']),synced: serializer.fromJson<bool>(json['synced']),isRead: serializer.fromJson<bool>(json['isRead']),recipientUid: serializer.fromJson<String?>(json['recipientUid']),cipherBlob: serializer.fromJson<String?>(json['cipherBlob']),);}
 @override Map<String, dynamic> toJson({ValueSerializer? serializer}) {
 serializer ??= driftRuntimeOptions.defaultSerializer;
 return <String, dynamic>{
-'id': serializer.toJson<String>(id),'senderUid': serializer.toJson<String>(senderUid),'contentEncrypted': serializer.toJson<String>(contentEncrypted),'ttl': serializer.toJson<int>(ttl),'timestamp': serializer.toJson<DateTime>(timestamp),'lane': serializer.toJson<String>(lane),'synced': serializer.toJson<bool>(synced),'isRead': serializer.toJson<bool>(isRead),};}MessageRecord copyWith({String? id,String? senderUid,String? contentEncrypted,int? ttl,DateTime? timestamp,String? lane,bool? synced,bool? isRead}) => MessageRecord(id: id ?? this.id,senderUid: senderUid ?? this.senderUid,contentEncrypted: contentEncrypted ?? this.contentEncrypted,ttl: ttl ?? this.ttl,timestamp: timestamp ?? this.timestamp,lane: lane ?? this.lane,synced: synced ?? this.synced,isRead: isRead ?? this.isRead,);MessageRecord copyWithCompanion(MessageRecordsCompanion data) {
+'id': serializer.toJson<String>(id),'senderUid': serializer.toJson<String>(senderUid),'contentEncrypted': serializer.toJson<String>(contentEncrypted),'ttl': serializer.toJson<int>(ttl),'timestamp': serializer.toJson<DateTime>(timestamp),'lane': serializer.toJson<String>(lane),'synced': serializer.toJson<bool>(synced),'isRead': serializer.toJson<bool>(isRead),'recipientUid': serializer.toJson<String?>(recipientUid),'cipherBlob': serializer.toJson<String?>(cipherBlob),};}MessageRecord copyWith({String? id,String? senderUid,String? contentEncrypted,int? ttl,DateTime? timestamp,String? lane,bool? synced,bool? isRead,Value<String?> recipientUid = const Value.absent(),Value<String?> cipherBlob = const Value.absent()}) => MessageRecord(id: id ?? this.id,senderUid: senderUid ?? this.senderUid,contentEncrypted: contentEncrypted ?? this.contentEncrypted,ttl: ttl ?? this.ttl,timestamp: timestamp ?? this.timestamp,lane: lane ?? this.lane,synced: synced ?? this.synced,isRead: isRead ?? this.isRead,recipientUid: recipientUid.present ? recipientUid.value : this.recipientUid,cipherBlob: cipherBlob.present ? cipherBlob.value : this.cipherBlob,);MessageRecord copyWithCompanion(MessageRecordsCompanion data) {
 return MessageRecord(
-id: data.id.present ? data.id.value : this.id,senderUid: data.senderUid.present ? data.senderUid.value : this.senderUid,contentEncrypted: data.contentEncrypted.present ? data.contentEncrypted.value : this.contentEncrypted,ttl: data.ttl.present ? data.ttl.value : this.ttl,timestamp: data.timestamp.present ? data.timestamp.value : this.timestamp,lane: data.lane.present ? data.lane.value : this.lane,synced: data.synced.present ? data.synced.value : this.synced,isRead: data.isRead.present ? data.isRead.value : this.isRead,);
+id: data.id.present ? data.id.value : this.id,senderUid: data.senderUid.present ? data.senderUid.value : this.senderUid,contentEncrypted: data.contentEncrypted.present ? data.contentEncrypted.value : this.contentEncrypted,ttl: data.ttl.present ? data.ttl.value : this.ttl,timestamp: data.timestamp.present ? data.timestamp.value : this.timestamp,lane: data.lane.present ? data.lane.value : this.lane,synced: data.synced.present ? data.synced.value : this.synced,isRead: data.isRead.present ? data.isRead.value : this.isRead,recipientUid: data.recipientUid.present ? data.recipientUid.value : this.recipientUid,cipherBlob: data.cipherBlob.present ? data.cipherBlob.value : this.cipherBlob,);
 }
 @override
-String toString() {return (StringBuffer('MessageRecord(')..write('id: $id, ')..write('senderUid: $senderUid, ')..write('contentEncrypted: $contentEncrypted, ')..write('ttl: $ttl, ')..write('timestamp: $timestamp, ')..write('lane: $lane, ')..write('synced: $synced, ')..write('isRead: $isRead')..write(')')).toString();}
+String toString() {return (StringBuffer('MessageRecord(')..write('id: $id, ')..write('senderUid: $senderUid, ')..write('contentEncrypted: $contentEncrypted, ')..write('ttl: $ttl, ')..write('timestamp: $timestamp, ')..write('lane: $lane, ')..write('synced: $synced, ')..write('isRead: $isRead, ')..write('recipientUid: $recipientUid, ')..write('cipherBlob: $cipherBlob')..write(')')).toString();}
 @override
- int get hashCode => Object.hash(id, senderUid, contentEncrypted, ttl, timestamp, lane, synced, isRead);@override
-bool operator ==(Object other) => identical(this, other) || (other is MessageRecord && other.id == this.id && other.senderUid == this.senderUid && other.contentEncrypted == this.contentEncrypted && other.ttl == this.ttl && other.timestamp == this.timestamp && other.lane == this.lane && other.synced == this.synced && other.isRead == this.isRead);
+ int get hashCode => Object.hash(id, senderUid, contentEncrypted, ttl, timestamp, lane, synced, isRead, recipientUid, cipherBlob);@override
+bool operator ==(Object other) => identical(this, other) || (other is MessageRecord && other.id == this.id && other.senderUid == this.senderUid && other.contentEncrypted == this.contentEncrypted && other.ttl == this.ttl && other.timestamp == this.timestamp && other.lane == this.lane && other.synced == this.synced && other.isRead == this.isRead && other.recipientUid == this.recipientUid && other.cipherBlob == this.cipherBlob);
 }class MessageRecordsCompanion extends UpdateCompanion<MessageRecord> {
 final Value<String> id;
 final Value<String> senderUid;
@@ -319,9 +345,11 @@ final Value<DateTime> timestamp;
 final Value<String> lane;
 final Value<bool> synced;
 final Value<bool> isRead;
+final Value<String?> recipientUid;
+final Value<String?> cipherBlob;
 final Value<int> rowid;
-const MessageRecordsCompanion({this.id = const Value.absent(),this.senderUid = const Value.absent(),this.contentEncrypted = const Value.absent(),this.ttl = const Value.absent(),this.timestamp = const Value.absent(),this.lane = const Value.absent(),this.synced = const Value.absent(),this.isRead = const Value.absent(),this.rowid = const Value.absent(),});
-MessageRecordsCompanion.insert({required String id,required String senderUid,required String contentEncrypted,required int ttl,required DateTime timestamp,this.lane = const Value.absent(),this.synced = const Value.absent(),this.isRead = const Value.absent(),this.rowid = const Value.absent(),}): id = Value(id), senderUid = Value(senderUid), contentEncrypted = Value(contentEncrypted), ttl = Value(ttl), timestamp = Value(timestamp);
+const MessageRecordsCompanion({this.id = const Value.absent(),this.senderUid = const Value.absent(),this.contentEncrypted = const Value.absent(),this.ttl = const Value.absent(),this.timestamp = const Value.absent(),this.lane = const Value.absent(),this.synced = const Value.absent(),this.isRead = const Value.absent(),this.recipientUid = const Value.absent(),this.cipherBlob = const Value.absent(),this.rowid = const Value.absent(),});
+MessageRecordsCompanion.insert({required String id,required String senderUid,required String contentEncrypted,required int ttl,required DateTime timestamp,this.lane = const Value.absent(),this.synced = const Value.absent(),this.isRead = const Value.absent(),this.recipientUid = const Value.absent(),this.cipherBlob = const Value.absent(),this.rowid = const Value.absent(),}): id = Value(id), senderUid = Value(senderUid), contentEncrypted = Value(contentEncrypted), ttl = Value(ttl), timestamp = Value(timestamp);
 static Insertable<MessageRecord> custom({Expression<String>? id, 
 Expression<String>? senderUid, 
 Expression<String>? contentEncrypted, 
@@ -330,11 +358,13 @@ Expression<DateTime>? timestamp,
 Expression<String>? lane, 
 Expression<bool>? synced, 
 Expression<bool>? isRead, 
+Expression<String>? recipientUid, 
+Expression<String>? cipherBlob, 
 Expression<int>? rowid, 
 }) {
-return RawValuesInsertable({if (id != null)'id': id,if (senderUid != null)'sender_uid': senderUid,if (contentEncrypted != null)'content_encrypted': contentEncrypted,if (ttl != null)'ttl': ttl,if (timestamp != null)'timestamp': timestamp,if (lane != null)'lane': lane,if (synced != null)'synced': synced,if (isRead != null)'is_read': isRead,if (rowid != null)'rowid': rowid,});
-}MessageRecordsCompanion copyWith({Value<String>? id, Value<String>? senderUid, Value<String>? contentEncrypted, Value<int>? ttl, Value<DateTime>? timestamp, Value<String>? lane, Value<bool>? synced, Value<bool>? isRead, Value<int>? rowid}) {
-return MessageRecordsCompanion(id: id ?? this.id,senderUid: senderUid ?? this.senderUid,contentEncrypted: contentEncrypted ?? this.contentEncrypted,ttl: ttl ?? this.ttl,timestamp: timestamp ?? this.timestamp,lane: lane ?? this.lane,synced: synced ?? this.synced,isRead: isRead ?? this.isRead,rowid: rowid ?? this.rowid,);
+return RawValuesInsertable({if (id != null)'id': id,if (senderUid != null)'sender_uid': senderUid,if (contentEncrypted != null)'content_encrypted': contentEncrypted,if (ttl != null)'ttl': ttl,if (timestamp != null)'timestamp': timestamp,if (lane != null)'lane': lane,if (synced != null)'synced': synced,if (isRead != null)'is_read': isRead,if (recipientUid != null)'recipient_uid': recipientUid,if (cipherBlob != null)'cipher_blob': cipherBlob,if (rowid != null)'rowid': rowid,});
+}MessageRecordsCompanion copyWith({Value<String>? id, Value<String>? senderUid, Value<String>? contentEncrypted, Value<int>? ttl, Value<DateTime>? timestamp, Value<String>? lane, Value<bool>? synced, Value<bool>? isRead, Value<String?>? recipientUid, Value<String?>? cipherBlob, Value<int>? rowid}) {
+return MessageRecordsCompanion(id: id ?? this.id,senderUid: senderUid ?? this.senderUid,contentEncrypted: contentEncrypted ?? this.contentEncrypted,ttl: ttl ?? this.ttl,timestamp: timestamp ?? this.timestamp,lane: lane ?? this.lane,synced: synced ?? this.synced,isRead: isRead ?? this.isRead,recipientUid: recipientUid ?? this.recipientUid,cipherBlob: cipherBlob ?? this.cipherBlob,rowid: rowid ?? this.rowid,);
 }
 @override
 Map<String, Expression> toColumns(bool nullToAbsent) {
@@ -354,12 +384,16 @@ if (synced.present) {
 map['synced'] = Variable<bool>(synced.value);}
 if (isRead.present) {
 map['is_read'] = Variable<bool>(isRead.value);}
+if (recipientUid.present) {
+map['recipient_uid'] = Variable<String>(recipientUid.value);}
+if (cipherBlob.present) {
+map['cipher_blob'] = Variable<String>(cipherBlob.value);}
 if (rowid.present) {
 map['rowid'] = Variable<int>(rowid.value);}
 return map; 
 }
 @override
-String toString() {return (StringBuffer('MessageRecordsCompanion(')..write('id: $id, ')..write('senderUid: $senderUid, ')..write('contentEncrypted: $contentEncrypted, ')..write('ttl: $ttl, ')..write('timestamp: $timestamp, ')..write('lane: $lane, ')..write('synced: $synced, ')..write('isRead: $isRead, ')..write('rowid: $rowid')..write(')')).toString();}
+String toString() {return (StringBuffer('MessageRecordsCompanion(')..write('id: $id, ')..write('senderUid: $senderUid, ')..write('contentEncrypted: $contentEncrypted, ')..write('ttl: $ttl, ')..write('timestamp: $timestamp, ')..write('lane: $lane, ')..write('synced: $synced, ')..write('isRead: $isRead, ')..write('recipientUid: $recipientUid, ')..write('cipherBlob: $cipherBlob, ')..write('rowid: $rowid')..write(')')).toString();}
 }
 class $SosRecordsTable extends SosRecords with TableInfo<$SosRecordsTable, SosRecord>{
 @override final GeneratedDatabase attachedDatabase;
@@ -953,8 +987,8 @@ GeneratedColumn<bool> get synced => $composableBuilder(
     (AttendanceProof,BaseReferences<_$AppDatabase,$AttendanceProofsTable,AttendanceProof>),
     AttendanceProof,
     PrefetchHooks Function()
-    >;typedef $$MessageRecordsTableCreateCompanionBuilder = MessageRecordsCompanion Function({required String id,required String senderUid,required String contentEncrypted,required int ttl,required DateTime timestamp,Value<String> lane,Value<bool> synced,Value<bool> isRead,Value<int> rowid,});
-typedef $$MessageRecordsTableUpdateCompanionBuilder = MessageRecordsCompanion Function({Value<String> id,Value<String> senderUid,Value<String> contentEncrypted,Value<int> ttl,Value<DateTime> timestamp,Value<String> lane,Value<bool> synced,Value<bool> isRead,Value<int> rowid,});
+    >;typedef $$MessageRecordsTableCreateCompanionBuilder = MessageRecordsCompanion Function({required String id,required String senderUid,required String contentEncrypted,required int ttl,required DateTime timestamp,Value<String> lane,Value<bool> synced,Value<bool> isRead,Value<String?> recipientUid,Value<String?> cipherBlob,Value<int> rowid,});
+typedef $$MessageRecordsTableUpdateCompanionBuilder = MessageRecordsCompanion Function({Value<String> id,Value<String> senderUid,Value<String> contentEncrypted,Value<int> ttl,Value<DateTime> timestamp,Value<String> lane,Value<bool> synced,Value<bool> isRead,Value<String?> recipientUid,Value<String?> cipherBlob,Value<int> rowid,});
 class $$MessageRecordsTableFilterComposer extends Composer<
         _$AppDatabase,
         $MessageRecordsTable> {
@@ -1002,6 +1036,16 @@ ColumnFilters<bool> get synced => $composableBuilder(
       
 ColumnFilters<bool> get isRead => $composableBuilder(
       column: $table.isRead,
+      builder: (column) => 
+      ColumnFilters(column));
+      
+ColumnFilters<String> get recipientUid => $composableBuilder(
+      column: $table.recipientUid,
+      builder: (column) => 
+      ColumnFilters(column));
+      
+ColumnFilters<String> get cipherBlob => $composableBuilder(
+      column: $table.cipherBlob,
       builder: (column) => 
       ColumnFilters(column));
       
@@ -1056,6 +1100,16 @@ ColumnOrderings<bool> get isRead => $composableBuilder(
       builder: (column) => 
       ColumnOrderings(column));
       
+ColumnOrderings<String> get recipientUid => $composableBuilder(
+      column: $table.recipientUid,
+      builder: (column) => 
+      ColumnOrderings(column));
+      
+ColumnOrderings<String> get cipherBlob => $composableBuilder(
+      column: $table.cipherBlob,
+      builder: (column) => 
+      ColumnOrderings(column));
+      
         }
       class $$MessageRecordsTableAnnotationComposer extends Composer<
         _$AppDatabase,
@@ -1099,6 +1153,14 @@ GeneratedColumn<bool> get isRead => $composableBuilder(
       column: $table.isRead,
       builder: (column) => column);
       
+GeneratedColumn<String> get recipientUid => $composableBuilder(
+      column: $table.recipientUid,
+      builder: (column) => column);
+      
+GeneratedColumn<String> get cipherBlob => $composableBuilder(
+      column: $table.cipherBlob,
+      builder: (column) => column);
+      
         }
       class $$MessageRecordsTableTableManager extends RootTableManager    <_$AppDatabase,
     $MessageRecordsTable,
@@ -1119,8 +1181,8 @@ GeneratedColumn<bool> get isRead => $composableBuilder(
         createFilteringComposer: () => $$MessageRecordsTableFilterComposer($db: db,$table:table),
         createOrderingComposer: () => $$MessageRecordsTableOrderingComposer($db: db,$table:table),
         createComputedFieldComposer: () => $$MessageRecordsTableAnnotationComposer($db: db,$table:table),
-        updateCompanionCallback: ({Value<String> id = const Value.absent(),Value<String> senderUid = const Value.absent(),Value<String> contentEncrypted = const Value.absent(),Value<int> ttl = const Value.absent(),Value<DateTime> timestamp = const Value.absent(),Value<String> lane = const Value.absent(),Value<bool> synced = const Value.absent(),Value<bool> isRead = const Value.absent(),Value<int> rowid = const Value.absent(),})=> MessageRecordsCompanion(id: id,senderUid: senderUid,contentEncrypted: contentEncrypted,ttl: ttl,timestamp: timestamp,lane: lane,synced: synced,isRead: isRead,rowid: rowid,),
-        createCompanionCallback: ({required String id,required String senderUid,required String contentEncrypted,required int ttl,required DateTime timestamp,Value<String> lane = const Value.absent(),Value<bool> synced = const Value.absent(),Value<bool> isRead = const Value.absent(),Value<int> rowid = const Value.absent(),})=> MessageRecordsCompanion.insert(id: id,senderUid: senderUid,contentEncrypted: contentEncrypted,ttl: ttl,timestamp: timestamp,lane: lane,synced: synced,isRead: isRead,rowid: rowid,),
+        updateCompanionCallback: ({Value<String> id = const Value.absent(),Value<String> senderUid = const Value.absent(),Value<String> contentEncrypted = const Value.absent(),Value<int> ttl = const Value.absent(),Value<DateTime> timestamp = const Value.absent(),Value<String> lane = const Value.absent(),Value<bool> synced = const Value.absent(),Value<bool> isRead = const Value.absent(),Value<String?> recipientUid = const Value.absent(),Value<String?> cipherBlob = const Value.absent(),Value<int> rowid = const Value.absent(),})=> MessageRecordsCompanion(id: id,senderUid: senderUid,contentEncrypted: contentEncrypted,ttl: ttl,timestamp: timestamp,lane: lane,synced: synced,isRead: isRead,recipientUid: recipientUid,cipherBlob: cipherBlob,rowid: rowid,),
+        createCompanionCallback: ({required String id,required String senderUid,required String contentEncrypted,required int ttl,required DateTime timestamp,Value<String> lane = const Value.absent(),Value<bool> synced = const Value.absent(),Value<bool> isRead = const Value.absent(),Value<String?> recipientUid = const Value.absent(),Value<String?> cipherBlob = const Value.absent(),Value<int> rowid = const Value.absent(),})=> MessageRecordsCompanion.insert(id: id,senderUid: senderUid,contentEncrypted: contentEncrypted,ttl: ttl,timestamp: timestamp,lane: lane,synced: synced,isRead: isRead,recipientUid: recipientUid,cipherBlob: cipherBlob,rowid: rowid,),
         withReferenceMapper: (p0) => p0
               .map(
                   (e) =>

@@ -96,6 +96,13 @@ class MeshService {
   final _ackController =
       StreamController<MeshPacket>.broadcast();
 
+  /// 1:1 encrypted direct message packets (Lane B, Milestone 7). Carries
+  /// every directMessage packet seen on this node regardless of
+  /// recipientUid — SocialService checks whether it's addressed to this
+  /// device before attempting to decrypt.
+  final _directMessageController =
+      StreamController<MeshPacket>.broadcast();
+
   /// Attendance advertisement-only packets with their BLE RSSI value.
   /// These are the 18-byte advertisement headers scanned from the air —
   /// they contain NO payload but carry real proximity data (RSSI).
@@ -107,6 +114,8 @@ class MeshService {
   Stream<MeshPacket> get messagePackets    => _messageController.stream;
   Stream<MeshPacket> get sosPackets        => _sosController.stream;
   Stream<MeshPacket> get ackPackets        => _ackController.stream;
+  Stream<MeshPacket> get directMessagePackets =>
+      _directMessageController.stream;
 
   /// Attendance BLE advertisement stream — carries real RSSI for proximity proof.
   /// Emits whenever the scanner receives a peer advertising PacketType.attendance.
@@ -164,6 +173,7 @@ class MeshService {
     _messageController.close();
     _sosController.close();
     _ackController.close();
+    _directMessageController.close();
     _attendanceAdvController.close();
     _initialized = false;
   }
@@ -193,10 +203,12 @@ class MeshService {
 
     // retryOnAllFailure: true for SOS (safety-critical) AND messages (slow
     // without retry — if _peerDevices is empty on send, the message is silently
-    // dropped with no fallback on BLE-only setups).
+    // dropped with no fallback on BLE-only setups). Direct messages get the
+    // same treatment as broadcast messages for the same reason.
     // Attendance and ACK re-broadcast is handled by their own timers.
     final needsRetry = packet.type == PacketType.sos ||
-        packet.type == PacketType.message;
+        packet.type == PacketType.message ||
+        packet.type == PacketType.directMessage;
 
     _transport.broadcastPacket(
       packet.toBytes(),
@@ -236,6 +248,15 @@ class MeshService {
     }
 
     // ── 3. Full GATT packet — lane dispatch ───────────────────────────────
+    // Logged with the [Mesh] tag so a 3-phone relay test can be verified via
+    // `adb logcat | grep "\[Mesh\]"` on each device — see
+    // VEXT_TESTING_DEMO_GUIDE.md §10 "3-Phone Mesh Relay Verification". An
+    // RX line on the middle phone followed by a TX-relay line (below, in
+    // _scheduleRelay) for the SAME packet id, followed by an RX line with
+    // that id on the far phone, is proof of an actual multi-hop relay rather
+    // than two coincidental direct links.
+    debugPrint('[Mesh] RX  $packet rssi=$rssi');
+
     switch (packet.type) {
       case PacketType.attendance:
         _attendanceController.add(packet);
@@ -254,6 +275,9 @@ class MeshService {
 
       case PacketType.ack:
         _ackController.add(packet);
+
+      case PacketType.directMessage:
+        _directMessageController.add(packet);
     }
 
     // ── 4. Relay — forward if TTL still allows ────────────────────────────
@@ -285,6 +309,10 @@ class MeshService {
 
       final relayed = packet.decrementTtl();
       if (relayed.isExpired) return;
+
+      // See the matching RX log in _handleIncomingPacket — pair these two
+      // lines across devices to prove multi-hop relay during physical testing.
+      debugPrint('[Mesh] TX-relay $relayed (received at ttl ${packet.ttl})');
 
       // SOS relays also use the retry queue — a relay node failing to reach
       // its peers should retry for the same 30-second window (Fix 2C).

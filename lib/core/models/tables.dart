@@ -98,6 +98,24 @@ class MessageRecords extends Table {
   /// Whether the local user has read this message.
   BoolColumn get isRead => boolean().withDefault(const Constant(false))();
 
+  /// Recipient's Firebase UID — null for broadcast messages (Lane B group
+  /// chat, unchanged behaviour). Non-null for a 1:1 direct message
+  /// (Milestone 7). watchAllMessages()/allMessages() filter this to null so
+  /// DMs never leak into the public broadcast feed.
+  TextColumn get recipientUid => text().nullable()();
+
+  /// Base64 of EncryptedMessage.toBytes() (nonce+mac+ciphertext) — set only
+  /// for direct messages, null for broadcast rows.
+  ///
+  /// contentEncrypted always holds human-readable PLAINTEXT for every row
+  /// (broadcast — unencrypted by design — and DM, after this device either
+  /// composed or successfully decrypted it). That's what the UI renders
+  /// directly with zero decrypt step. cipherBlob exists purely so
+  /// FirebaseSyncEngine has the real ciphertext bytes to mirror to Firestore
+  /// for DM rows without ever uploading plaintext or re-deriving the
+  /// ciphertext at sync time.
+  TextColumn get cipherBlob => text().nullable()();
+
   @override
   Set<Column> get primaryKey => {id};
 }

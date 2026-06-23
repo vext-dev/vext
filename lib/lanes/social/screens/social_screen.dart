@@ -24,11 +24,13 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 
 import '../../../core/app_constants.dart';
 import '../../../core/app_theme.dart';
 import '../../../providers/providers.dart';
 import '../../../services/drift_service.dart';
+import '../social_service.dart';
 
 // Convenience local color aliases — keep in sync with AppTheme
 const _kSurface = Color(0xFF060E1A); // AppTheme.backgroundColor
@@ -96,6 +98,31 @@ class _SocialScreenState extends ConsumerState<SocialScreen> {
     }
   }
 
+  /// Opens the 1:1 encrypted DM thread with [peerUid].
+  /// Entry points: tapping a sender's name on a broadcast message, or
+  /// selecting a result from the user search sheet.
+  void _openDirectMessage(String peerUid, String peerName) {
+    if (peerUid.isEmpty) return;
+    context.push('/home/social/dm/$peerUid', extra: peerName);
+  }
+
+  Future<void> _openUserSearch() async {
+    final svc = ref.read(socialServiceProvider).valueOrNull;
+    if (svc == null) return;
+    final selected = await showModalBottomSheet<({String uid, String name})>(
+      context: context,
+      backgroundColor: _kSurface,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (context) => _UserSearchSheet(service: svc),
+    );
+    if (selected != null && mounted) {
+      _openDirectMessage(selected.uid, selected.name);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final serviceAsync = ref.watch(socialServiceProvider);
@@ -117,6 +144,12 @@ class _SocialScreenState extends ConsumerState<SocialScreen> {
           ),
         ),
         actions: [
+          IconButton(
+            tooltip: 'New direct message',
+            icon: const Icon(Icons.person_search_rounded,
+                color: AppTheme.primaryColor, size: 22),
+            onPressed: serviceAsync.hasValue ? _openUserSearch : null,
+          ),
           _MeshStatusChip(
             serviceReady: serviceAsync.hasValue && !serviceAsync.hasError,
           ),
@@ -160,6 +193,7 @@ class _SocialScreenState extends ConsumerState<SocialScreen> {
                       return _MessageBubble(
                         message: msg,
                         isOwn: isOwn,
+                        onTapSender: isOwn ? null : _openDirectMessage,
                       );
                     },
                   );
@@ -243,10 +277,16 @@ class _MessageBubble extends StatefulWidget {
   const _MessageBubble({
     required this.message,
     required this.isOwn,
+    this.onTapSender,
   });
 
   final MessageRecord message;
   final bool isOwn;
+
+  /// Called with (senderUid, resolvedName) when the sender label is tapped.
+  /// Null for own messages (no point DM'ing yourself) — see SocialScreen's
+  /// itemBuilder, which only passes this for incoming messages.
+  final void Function(String uid, String name)? onTapSender;
 
   @override
   State<_MessageBubble> createState() => _MessageBubbleState();
@@ -320,7 +360,10 @@ class _MessageBubbleState extends State<_MessageBubble> {
                   ? CrossAxisAlignment.end
                   : CrossAxisAlignment.start,
               children: [
-                // Sender label — only for incoming messages
+                // Sender label — only for incoming messages.
+                // Tappable: opens a 1:1 encrypted DM with this sender (see
+                // SocialScreen._openDirectMessage). This is the "tap a name"
+                // DM entry point.
                 if (!widget.isOwn)
                   Padding(
                     padding: const EdgeInsets.only(bottom: 4),
@@ -331,14 +374,23 @@ class _MessageBubbleState extends State<_MessageBubble> {
                         // On resolve: show the real name (or UID fallback).
                         final label = snapshot.data ??
                             _shortUid(widget.message.senderUid);
-                        return Text(
+                        final text = Text(
                           label,
                           style: const TextStyle(
                             color: AppTheme.primaryColor,
                             fontSize: 11,
                             fontWeight: FontWeight.w600,
                             letterSpacing: 0.5,
+                            decoration: TextDecoration.underline,
+                            decorationColor: AppTheme.primaryColor,
                           ),
+                        );
+                        if (widget.onTapSender == null) return text;
+                        return GestureDetector(
+                          behavior: HitTestBehavior.opaque,
+                          onTap: () => widget.onTapSender!(
+                              widget.message.senderUid, label),
+                          child: text,
                         );
                       },
                     ),
@@ -545,6 +597,197 @@ class _ServiceErrorView extends StatelessWidget {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+// ── User search sheet ─────────────────────────────────────────────────────────
+//
+// The "search using the username" DM entry point. There's no separate
+// username field in this app — search is by display name (users/{uid}.name),
+// matching SocialService.searchUsersByName and the existing sender-name
+// lookup pattern used elsewhere in this screen.
+//
+// Pops with the selected (uid, name) record, or null if dismissed.
+
+class _UserSearchSheet extends StatefulWidget {
+  const _UserSearchSheet({required this.service});
+
+  final SocialService service;
+
+  @override
+  State<_UserSearchSheet> createState() => _UserSearchSheetState();
+}
+
+class _UserSearchSheetState extends State<_UserSearchSheet> {
+  final _searchController = TextEditingController();
+  List<({String uid, String name})> _results = [];
+  bool _loading = false;
+  String? _error;
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _runSearch(String query) async {
+    if (query.trim().isEmpty) {
+      setState(() {
+        _results = [];
+        _error = null;
+      });
+      return;
+    }
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final results = await widget.service.searchUsersByName(query);
+      if (!mounted) return;
+      setState(() {
+        _results = results;
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = 'Search failed: $e';
+        _loading = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: EdgeInsets.only(
+        left: 20,
+        right: 20,
+        top: 16,
+        bottom: MediaQuery.of(context).viewInsets.bottom + 16,
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Center(
+            child: Container(
+              width: 36,
+              height: 4,
+              margin: const EdgeInsets.only(bottom: 16),
+              decoration: BoxDecoration(
+                color: _kBorder,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+          ),
+          const Text(
+            'NEW MESSAGE',
+            style: TextStyle(
+              color: AppTheme.primaryColor,
+              fontSize: 14,
+              fontWeight: FontWeight.w800,
+              letterSpacing: 2,
+            ),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _searchController,
+            autofocus: true,
+            style: const TextStyle(color: _kTextPrimary, fontSize: 14),
+            onChanged: _runSearch,
+            decoration: InputDecoration(
+              hintText: 'Search by name…',
+              hintStyle: const TextStyle(color: _kHint, fontSize: 14),
+              prefixIcon:
+                  const Icon(Icons.search_rounded, color: _kHint, size: 20),
+              filled: true,
+              fillColor: _kCard,
+              contentPadding:
+                  const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(24),
+                borderSide: const BorderSide(color: _kBorder),
+              ),
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(24),
+                borderSide: const BorderSide(color: _kBorder),
+              ),
+              focusedBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(24),
+                borderSide:
+                    const BorderSide(color: AppTheme.primaryColor, width: 1.5),
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxHeight: 320),
+            child: _loading
+                ? const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 24),
+                    child: Center(
+                      child: SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(
+                          color: AppTheme.primaryColor,
+                          strokeWidth: 2,
+                        ),
+                      ),
+                    ),
+                  )
+                : _error != null
+                    ? Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 16),
+                        child: Text(
+                          _error!,
+                          style: const TextStyle(
+                              color: AppTheme.sosColor, fontSize: 12),
+                        ),
+                      )
+                    : _results.isEmpty
+                        ? Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 16),
+                            child: Text(
+                              _searchController.text.trim().isEmpty
+                                  ? 'Type a name to find someone'
+                                  : 'No matches',
+                              style: const TextStyle(
+                                  color: _kTextSecondary, fontSize: 13),
+                            ),
+                          )
+                        : ListView.builder(
+                            shrinkWrap: true,
+                            itemCount: _results.length,
+                            itemBuilder: (context, index) {
+                              final r = _results[index];
+                              return ListTile(
+                                contentPadding: EdgeInsets.zero,
+                                leading: CircleAvatar(
+                                  backgroundColor: _kCard,
+                                  child: Text(
+                                    r.name.isNotEmpty
+                                        ? r.name[0].toUpperCase()
+                                        : '?',
+                                    style: const TextStyle(
+                                        color: AppTheme.primaryColor),
+                                  ),
+                                ),
+                                title: Text(
+                                  r.name,
+                                  style: const TextStyle(
+                                      color: _kTextPrimary, fontSize: 14),
+                                ),
+                                onTap: () => Navigator.of(context).pop(r),
+                              );
+                            },
+                          ),
+          ),
+        ],
       ),
     );
   }

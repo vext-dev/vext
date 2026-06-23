@@ -52,6 +52,7 @@ import 'dart:async';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:drift/drift.dart' show Value;
 import 'package:flutter/foundation.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:uuid/uuid.dart';
 
 import '../../core/app_constants.dart';
@@ -73,6 +74,8 @@ class AttendanceSession {
     required this.startTime,
     required this.currentHmacToken,
     this.isActive = true,
+    this.geofenceLat,
+    this.geofenceLng,
   });
 
   final String id;           // UUID v4 — session identifier
@@ -82,12 +85,23 @@ class AttendanceSession {
   String currentHmacToken;   // Refreshed every ~89 s
   bool isActive;
 
+  /// Teacher's GPS fix captured once at session start — the geofence center
+  /// students' proofs are checked against (Milestone 7 GPS geofence).
+  /// Null when GPS was unavailable/denied/timed out at session start; in
+  /// that case the geofence check is skipped entirely for this session and
+  /// RSSI remains the sole gate — identical to pre-geofence behaviour.
+  /// GPS never blocks session start or attendance outright.
+  double? geofenceLat;
+  double? geofenceLng;
+
   Map<String, dynamic> toFirestore() => {
         'id': id,
         'courseId': courseId,
         'teacherUid': teacherUid,
         'startTime': Timestamp.fromDate(startTime),
         'isActive': isActive,
+        'geofenceLat': geofenceLat,
+        'geofenceLng': geofenceLng,
         'createdAt': FieldValue.serverTimestamp(),
       };
 }
@@ -308,6 +322,39 @@ class AttendanceService {
       currentHmacToken: hmacToken,
     );
 
+    // ── GPS geofence center (Milestone 7, best-effort, never blocks) ─────────
+    // Captured ONCE per session (not per 5-second broadcast) — mirrors the
+    // HMAC token's once-per-89s-window pattern. Mirrors SosService's GPS
+    // policy: permission/service/timeout failures are swallowed silently and
+    // _activeSession.geofenceLat/Lng simply stay null, in which case
+    // _assembleAndSubmitProof() skips the GPS gate for this entire session
+    // and falls back to RSSI-only — the exact pre-geofence behaviour. GPS
+    // must never block startSession() or attendance marking outright.
+    try {
+      LocationPermission permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission == LocationPermission.whileInUse ||
+          permission == LocationPermission.always) {
+        final position = await Geolocator.getCurrentPosition(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.high,
+            timeLimit: Duration(seconds: 3),
+          ),
+        );
+        // Discard low-quality fixes rather than trusting a noisy reading —
+        // mirrors the RSSI gate's "don't trust a bad signal" philosophy.
+        if (position.accuracy <= AppConstants.gpsMinAccuracyMetres) {
+          _activeSession!.geofenceLat = position.latitude;
+          _activeSession!.geofenceLng = position.longitude;
+        }
+      }
+    } catch (_) {
+      // Permission denied, location services off, or 3 s timeout — proceed
+      // without a geofence center. Never blocks session start.
+    }
+
     // Fire-and-forget Firestore session write (Fix: offline session start).
     //
     // PREVIOUS BUG: `await _writeSessionToFirestore(...)` blocked startSession()
@@ -501,6 +548,8 @@ class AttendanceService {
       senderUid: _currentUserUid,
       sessionId: session.id,
       hmacToken: session.currentHmacToken,
+      geofenceLat: session.geofenceLat,
+      geofenceLng: session.geofenceLng,
     );
 
     await _mesh.sendPacket(packet);
@@ -524,6 +573,8 @@ class AttendanceService {
 
     final sessionId = decoded.sessionId;
     final hmacToken = decoded.hmacToken;
+    final geofenceLat = decoded.geofenceLat;
+    final geofenceLng = decoded.geofenceLng;
 
     // Guard 1: already submitted successfully — permanent block.
     if (_submittedSessionIds.contains(sessionId)) return;
@@ -544,6 +595,8 @@ class AttendanceService {
       sessionId: sessionId,
       hmacToken: hmacToken,
       gattRssi: 0,
+      geofenceLat: geofenceLat,
+      geofenceLng: geofenceLng,
     ).ignore();
   }
 
@@ -575,6 +628,8 @@ class AttendanceService {
     required String sessionId,
     required String hmacToken,
     required int gattRssi,
+    double? geofenceLat,
+    double? geofenceLng,
   }) async {
     // Read the best advertisement RSSI captured in the last 30 seconds.
     // Do NOT clear the cache yet — clearing before the gate check is the bug:
@@ -604,6 +659,16 @@ class AttendanceService {
       // for the next GATT packet that arrives within the 30-second window.
       // The cache naturally expires via the staleness check in
       // _onAttendanceAdvertisement once 30 seconds have elapsed.
+      //
+      // BUG FIX: this early return happens before the try/finally below that
+      // normally clears _inProgressSessionIds. Without releasing it here,
+      // Guard 2 in _onAttendancePacket() would block EVERY subsequent packet
+      // for this session forever — a student rejected once for weak signal
+      // could never retry even after walking right up to the teacher, since
+      // sessionId would never be in _inProgressSessionIds again. Must release
+      // the guard on every early-return path, not just the success/failure
+      // paths inside the try/finally.
+      _inProgressSessionIds.remove(sessionId);
       _safeEmit(AttendanceStatus(
         type: AttendanceStatusType.error,
         sessionId: sessionId,
@@ -620,6 +685,71 @@ class AttendanceService {
     _bestAdvertisementRssi = null;
     _bestAdvertisementRssiTime = null;
 
+    // ── GPS geofence gate (Milestone 7) ─────────────────────────────────────
+    // Only runs if the teacher's packet carried a geofence center, i.e. the
+    // teacher's device had a usable GPS fix at session start (see
+    // startSession()). If the teacher had no fix, this whole block is
+    // skipped and RSSI remains the sole gate — identical to pre-geofence
+    // behaviour. Same if the student's own GPS is unavailable/denied/timed
+    // out below: GPS never blocks attendance outright, it only adds a
+    // stricter check when BOTH sides have a usable fix ("RSSI + GPS, both
+    // must pass" per the plan, without regressing the existing RSSI-only
+    // fallback for GPS-denied devices).
+    double? studentLat;
+    double? studentLng;
+    if (geofenceLat != null && geofenceLng != null) {
+      try {
+        LocationPermission permission = await Geolocator.checkPermission();
+        if (permission == LocationPermission.denied) {
+          permission = await Geolocator.requestPermission();
+        }
+        if (permission == LocationPermission.whileInUse ||
+            permission == LocationPermission.always) {
+          final position = await Geolocator.getCurrentPosition(
+            locationSettings: const LocationSettings(
+              accuracy: LocationAccuracy.high,
+              timeLimit: Duration(seconds: 3),
+            ),
+          );
+          if (position.accuracy <= AppConstants.gpsMinAccuracyMetres) {
+            studentLat = position.latitude;
+            studentLng = position.longitude;
+          }
+        }
+      } catch (_) {
+        // Permission denied, services off, or timeout — studentLat/Lng stay
+        // null, which skips the distance check below (fail-open).
+      }
+
+      if (studentLat != null && studentLng != null) {
+        final distanceMetres = Geolocator.distanceBetween(
+          geofenceLat,
+          geofenceLng,
+          studentLat,
+          studentLng,
+        );
+        if (distanceMetres > AppConstants.geofenceRadiusDefault) {
+          // Rejected — mirrors the RSSI gate's early-return shape. The
+          // advertisement RSSI cache was already cleared above; that's fine,
+          // it carries no GPS-relevant state and the student can simply
+          // retry once back inside the geofence (next re-broadcast or
+          // advertisement will repopulate it). Must release the in-progress
+          // guard here too — see the matching fix/comment on the RSSI gate
+          // above; the same "stuck forever" bug applies to any early return.
+          _inProgressSessionIds.remove(sessionId);
+          _safeEmit(AttendanceStatus(
+            type: AttendanceStatusType.error,
+            sessionId: sessionId,
+            error: 'Outside the classroom geofence '
+                '(${distanceMetres.round()} m away, '
+                'limit ${AppConstants.geofenceRadiusDefault.round()} m). '
+                'Move closer.',
+          ));
+          return;
+        }
+      }
+    }
+
     final proofId = const Uuid().v4();
     final now = DateTime.now();
 
@@ -630,8 +760,8 @@ class AttendanceService {
       hmacToken: Value(hmacToken),
       rssi: Value(effectiveRssi),
       timestamp: Value(now),
-      gpsLat: const Value<double?>(null),   // GPS proximity added in Milestone 7
-      gpsLng: const Value<double?>(null),
+      gpsLat: Value<double?>(studentLat),   // GPS proximity added in Milestone 7
+      gpsLng: Value<double?>(studentLng),
       synced: const Value(false),
     );
 

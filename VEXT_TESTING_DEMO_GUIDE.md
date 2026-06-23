@@ -350,12 +350,214 @@ Practical meaning:
 
 ### Logcat filter for demo:
 ```
-adb logcat | grep -E "\[BLE\]|\[SOS\]|\[Social\]|\[Attendance\]|\[SyncEngine\]|\[FGService\]"
+adb logcat | grep -E "\[BLE\]|\[Mesh\]|\[SOS\]|\[Social\]|\[Attendance\]|\[SyncEngine\]|\[FGService\]"
 ```
 
 ---
 
-## 10. Known Limitations for the Demo
+## 10. 3-Phone Mesh Relay Verification (A → B → C)
+
+**Why this test exists:** every test in §6 above uses two phones in direct
+BLE range. That proves point-to-point delivery, not relay. The mesh's actual
+value proposition — a node forwarding a packet on behalf of two nodes that
+can't hear each other — has never been physically confirmed. This test
+isolates and proves (or disproves) that specific behaviour.
+
+Two log lines were added to `mesh_service.dart` for this test (tag `[Mesh]`,
+filterable with `adb logcat | grep "\[Mesh\]"`):
+- `[Mesh] RX  MeshPacket(id: xxxxxxxx…, type: …, ttl: N, sender: ssss …) rssi=R` — logged on receipt of any full (non-advertisement) packet, on every phone that receives it.
+- `[Mesh] TX-relay MeshPacket(id: xxxxxxxx…, …, ttl: N-1, …) (received at ttl N)` — logged immediately before a phone re-broadcasts a packet it received, on the relaying phone only.
+
+The same `id` prefix appearing in an RX line on Phone C, after an RX→TX-relay
+pair with that same `id` on Phone B, is unambiguous proof of a 3-hop path. If
+Phone C's RX line never appears: check Phone B's logs to see whether it
+received but never relayed (TTL/backoff/GATT issue) or never received at all
+(A↔B link issue, or B was duty-cycle asleep).
+
+### Setup
+```
+3 Android phones, BLE hardware (no emulators).
+Label them:
+  A = originator
+  B = middle / relay
+  C = target
+Run `adb devices` and note each phone's serial so you can run
+`adb -s <serial> logcat` separately per phone (3 terminal windows/tabs).
+```
+
+### Pre-check — confirm B is actually required (do this before trusting any result)
+A false pass (A and C exchanging packets via a direct link, with B doing
+nothing) is the main risk here — rule it out first.
+```
+1. Position A and C far apart / behind a wall; position B roughly between
+   them, within normal BLE range (~5-10 m) of both A and C.
+2. Turn Bluetooth OFF on Phone B only (A and C stay on).
+3. Send a Social message from A (procedure in Test 5B below).
+4. Confirm it does NOT arrive on C within 30 s, and C's logcat shows no
+   `[Mesh] RX` line with that message's id.
+   - If it DOES arrive: A and C have a direct link — move them further apart
+     and repeat this pre-check until step 4 passes.
+5. Turn Bluetooth back ON on Phone B. Wait ~10 s for B to re-advertise and
+   for A/C to discover it before running the real tests below.
+```
+Topology is now confirmed: A↔B and B↔C are live links, A↔C is not.
+
+### Test 5A — SOS relay (hot path, 0 ms relay delay)
+SOS is the scenario the code comments explicitly call out as a known risk
+(`mesh_service.dart`, `onSosPacketReceived`: a relay node must boost its scan
+rate immediately on receipt or multi-hop delivery can take 30+ seconds).
+```
+On all 3 phones: WiFi OFF, Bluetooth ON, SOS tab open (keeps all three in
+"session"-equivalent duty cycle, not idle).
+
+PHONE A: Hold the SOS button 3 s → release. "SOS ACTIVE — RELAYING ON MESH."
+
+PHONE B logcat — expect within ~1-2 s:
+  [Mesh] RX  MeshPacket(id: <X>, type: PacketType.sos, ttl: 255, ...
+  [Mesh] TX-relay MeshPacket(id: <X>, ..., ttl: 254, ...) (received at ttl 255)
+
+PHONE C logcat — expect within ~1-3 s of B's TX-relay line:
+  [Mesh] RX  MeshPacket(id: <X>, type: PacketType.sos, ttl: 254, ...
+
+PHONE C UI: SOS tab shows an incoming alert card from A's name, within ~5 s
+of A releasing the button.
+```
+**Pass:** the same `id` (8-char prefix) appears in B's RX+TX-relay lines and
+C's RX line, ttl decremented by exactly 1, and C's SOS tab shows the alert.
+**Fail modes to distinguish:** id on B's RX but never B's TX-relay (relay
+scheduling/broadcast bug) vs. never appears on B at all (A↔B link issue,
+re-check pre-check setup) vs. on B's TX-relay but never C's RX (B↔C link
+issue, or C was duty-cycle asleep).
+
+### Test 5B — Social message relay (cold path, idle-adjacent duty cycle)
+Harder case: Social messages get no scan-rate boost like SOS does, so a relay
+phone caught mid-sleep when the packet arrives is a realistic failure mode.
+```
+On all 3 phones: WiFi OFF (forces BLE-only — otherwise Firestore could
+silently deliver the message and mask a broken relay), Bluetooth ON, Social
+tab open on all three (keeps 500 ms/500 ms "session" duty cycle — do NOT run
+this from the Profile tab, that drops to idle 1 s/30 s and risks a false
+negative purely from B being asleep when the packet arrives).
+
+PHONE A: Social tab → type a distinctive message (e.g. "RELAY-TEST-1") → Send.
+
+PHONE B logcat — expect within ~1 s:
+  [Mesh] RX  MeshPacket(id: <Y>, type: PacketType.message, ttl: 7, ...
+  [Mesh] TX-relay MeshPacket(id: <Y>, ..., ttl: 6, ...) (received at ttl 7)
+  (TX-relay lands 50-500 ms after RX — random backoff, AppConstants.backoffBaseMs/backoffMaxMs)
+
+PHONE C logcat — expect:
+  [Mesh] RX  MeshPacket(id: <Y>, type: PacketType.message, ttl: 6, ...
+
+PHONE C UI: "RELAY-TEST-1" appears in the Social chat within ~5-10 s of send.
+```
+**Pass:** same `id` prefix across B's RX/TX-relay and C's RX, ttl 7→6,
+message text visible on C. **Optional stress variant:** repeat with all
+three phones left on the Profile tab (idle duty cycle) to see how much
+latency the 30 s sleep window adds — informational, not a pass/fail
+requirement.
+
+### Result log (fill in after running)
+```
+Date:                 Devices (model / Android version):
+Test 5A (SOS):    PASS / FAIL    notes:
+Test 5B (Social): PASS / FAIL    notes:
+```
+
+---
+
+## 11. GPS Geofence Verification (Attendance, Milestone 7)
+
+**What changed:** the teacher's device now captures a GPS fix when a session
+starts (`AttendanceService.startSession()`) and broadcasts it as part of the
+attendance packet (wire-format extension in `mesh_packet.dart` — additive,
+no version bump, old packets without GPS still decode correctly). The
+student's device captures its own GPS fix when assembling a proof
+(`_assembleAndSubmitProof()`) and rejects the proof if the two fixes are more
+than `AppConstants.geofenceRadiusDefault` (50 m) apart.
+
+**This cannot be verified from the sandbox** — it requires real device GPS
+hardware and an actual physical location, unlike the wire-format encode/decode
+logic itself (covered by `test/unit/mesh_packet_test.dart`, pure Dart, no
+platform channel).
+
+**Fail-open design — GPS never blocks attendance outright:**
+- If the teacher's device has no GPS fix at session start (denied permission,
+  location services off, indoors with no fix within 3 s) → the attendance
+  packet carries no geofence center → every student's geofence check is
+  skipped for that entire session → RSSI is the sole gate (identical to
+  pre-Milestone-7 behaviour).
+- If a given student's device has no GPS fix when marking attendance → that
+  student's own geofence check is skipped → RSSI is the sole gate for that
+  student, even if the teacher's packet does carry a geofence center.
+- The geofence is an *additional, stricter* check that only applies when
+  **both** sides have a usable fix (accuracy ≤ `AppConstants.gpsMinAccuracyMetres`,
+  50 m) — this reconciles the plan's "RSSI + GPS, both must pass" requirement
+  without regressing the RSSI-only fallback the project already depends on
+  for GPS-denied/indoor devices.
+
+### Setup
+```
+2 Android phones (Teacher + Student), Location services ON on both,
+Location permission granted to the app ("while using app" or "always").
+Outdoors or near a window recommended — GPS fixes indoors can be slow or
+low-accuracy (> 50 m), which causes the fix to be silently discarded (see
+"Discard low-quality fixes" comment in startSession()) and the geofence
+check to be skipped for that side, same as no fix at all.
+```
+
+### Test 6A — Inside the geofence (expected: PASS as normal)
+```
+PHONE 1 (Teacher): Attendance tab → Teacher Mode → Start Session.
+PHONE 2 (Student): within ~50 m of Phone 1 → Student Mode.
+
+Expected: marks "Present" as usual within 5-15 s. No behavioural change
+visible — this confirms the geofence gate does not introduce a false
+rejection for a student who is actually in range.
+```
+
+### Test 6B — Outside the geofence (expected: REJECTED with a geofence error)
+```
+This needs the student's phone to have a real GPS fix that is genuinely
+> 50 m from the teacher's, while still being within BLE range (BLE can reach
+further than 50 m outdoors with a clear line of sight) — e.g. teacher and
+student in adjacent rooms/across a large open area/across a car park, NOT
+just both phones sitting on the same desk.
+
+PHONE 1 (Teacher): Start Session as in 6A.
+PHONE 2 (Student): Student Mode, positioned > 50 m away (confirm via Google
+Maps or similar on a third device) but still close enough for BLE to connect.
+
+Expected: status shows an error — "Outside the classroom geofence (NNN m
+away, limit 50 m). Move closer." — instead of "Marked Present ✓". Walking
+the student phone closer (< 50 m) and waiting for the next 5 s re-broadcast
+should then allow it to mark present normally.
+```
+
+### Test 6C — Retry-after-rejection (regression check for the
+`_inProgressSessionIds` leak bug found and fixed during implementation)
+```
+Immediately after Test 6B's rejection, walk Phone 2 to within the geofence
+(< 50 m) WITHOUT restarting the session or the app.
+
+Expected: within one re-broadcast cycle (~5 s), Phone 2 marks "Present ✓"
+normally. If it stays stuck on "Listening…" / never retries, that is a
+regression of the bug fixed in `_assembleAndSubmitProof()` (the RSSI/GPS
+rejection paths must release `_inProgressSessionIds`, not just the
+try/finally success/failure paths) — check that fix is still in place.
+```
+
+### Result log (fill in after running)
+```
+Date:                 Devices (model / Android version):
+Test 6A (in range):      PASS / FAIL    notes (distance, accuracy):
+Test 6B (out of range):  PASS / FAIL    notes (measured distance, error shown?):
+Test 6C (retry after rejection): PASS / FAIL    notes:
+```
+
+---
+
+## 12. Known Limitations for the Demo
 
 1. **Encryption is off** — Social messages are plaintext. The field is called `contentEncrypted` in the DB but stores plain text. This is Milestone 7 scope.
 
@@ -372,3 +574,5 @@ adb logcat | grep -E "\[BLE\]|\[SOS\]|\[Social\]|\[Attendance\]|\[SyncEngine\]|\
    Without this, the app compiles but the unique constraint is not enforced. The in-memory `_inProgressSessionIds` guard still prevents duplicates at runtime.
 
 6. **Firestore rules required** — The app assumes Firestore security rules are deployed. If they aren't, proof syncing will fail silently (Drift keeps data safe, sync retries every 10s).
+
+7. **GPS geofence requires a real outdoor-ish fix on both sides** — indoor/low-accuracy fixes (> 50 m accuracy) are silently discarded, which falls back to RSSI-only for that session/student rather than failing the demo. See §11 for the manual test procedure (not run from this sandbox — needs real device GPS).

@@ -52,7 +52,7 @@ class AppDatabase extends _$AppDatabase {
   }
 
   @override
-  int get schemaVersion => 2;
+  int get schemaVersion => 3;
 
   // ── Migration ────────────────────────────────────────────────────────────────
   //
@@ -121,6 +121,18 @@ class AppDatabase extends _$AppDatabase {
               'ALTER TABLE attendance_proofs_new RENAME TO attendance_proofs',
             );
           }
+
+          if (from < 3) {
+            // v2 → v3: Add recipientUid + cipherBlob to message_records for
+            // 1:1 direct messages (Milestone 7). Both are plain nullable
+            // columns with no uniqueness constraint, so — unlike the v1→v2
+            // change above — a simple ALTER TABLE ADD COLUMN suffices; no
+            // table recreate needed. Existing broadcast rows get NULL in
+            // both columns, which the app already treats as "this is a
+            // broadcast message" (recipientUid == null).
+            await m.addColumn(messageRecords, messageRecords.recipientUid);
+            await m.addColumn(messageRecords, messageRecords.cipherBlob);
+          }
         },
       );
 
@@ -174,9 +186,13 @@ class AppDatabase extends _$AppDatabase {
     return into(messageRecords).insertOnConflictUpdate(msg);
   }
 
-  /// All messages ordered newest-first — for the Social feed.
+  /// All BROADCAST messages ordered newest-first — for the Social feed.
+  /// Excludes direct messages (recipientUid != null) — Milestone 7 added
+  /// DMs to the same table; without this filter they would leak into the
+  /// public group chat view.
   Future<List<MessageRecord>> allMessages({int limit = 100}) {
     return (select(messageRecords)
+          ..where((t) => t.recipientUid.isNull())
           ..orderBy([(t) => OrderingTerm.desc(t.timestamp)])
           ..limit(limit))
         .get();
@@ -195,10 +211,29 @@ class AppDatabase extends _$AppDatabase {
         .write(const MessageRecordsCompanion(synced: Value(true)));
   }
 
-  /// Live-updating message list, newest-first — used by SocialScreen.
-  /// Emits on every insert/delete without manual polling.
+  /// Live-updating BROADCAST message list, newest-first — used by
+  /// SocialScreen. Emits on every insert/delete without manual polling.
+  /// Excludes direct messages — see [allMessages] for why.
   Stream<List<MessageRecord>> watchAllMessages({int limit = 200}) {
     return (select(messageRecords)
+          ..where((t) => t.recipientUid.isNull())
+          ..orderBy([(t) => OrderingTerm.desc(t.timestamp)])
+          ..limit(limit))
+        .watch();
+  }
+
+  /// Live-updating message list for a single 1:1 DM thread (either
+  /// direction — sent by me to peer, or sent by peer to me), newest-first.
+  /// Used by DirectMessageScreen.
+  Stream<List<MessageRecord>> watchDirectMessages(
+    String myUid,
+    String peerUid, {
+    int limit = 200,
+  }) {
+    return (select(messageRecords)
+          ..where((t) =>
+              (t.senderUid.equals(myUid) & t.recipientUid.equals(peerUid)) |
+              (t.senderUid.equals(peerUid) & t.recipientUid.equals(myUid)))
           ..orderBy([(t) => OrderingTerm.desc(t.timestamp)])
           ..limit(limit))
         .watch();
