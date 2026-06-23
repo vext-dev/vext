@@ -137,7 +137,7 @@
             android:name=".VextAlarmReceiver"
             android:exported="false">
             <intent-filter>
-                <action android:name="com.example.vext.DOZE_SCAN_RESTART" />
+                <action android:name="com.vext.vext_app.DOZE_SCAN_RESTART" />
             </intent-filter>
         </receiver>
 

@@ -22,6 +22,7 @@
 import 'dart:async';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -313,12 +314,17 @@ class _StatusCard extends StatelessWidget {
 
 // ── Live proof list — Firestore primary, Drift fallback (Fix 4A + 4B) ─────────
 //
-// Strategy:
-//   • Try Firestore first (shows all students, online + cloud-synced).
-//   • On permission-denied (session doc not yet on server) or any Firestore
-//     error, switch to Drift DB (shows students that sent ACK via BLE).
-//   • Auto-retry Firestore every 15 seconds so it upgrades automatically when
-//     the session doc reaches the server.
+// Strategy (connectivity-aware):
+//   • Check network connectivity immediately in initState.
+//   • If OFFLINE: skip Firestore entirely, go straight to Drift (BLE ACK path).
+//     This fixes the core offline bug: Firestore with offline persistence does
+//     NOT error when there's no network — it silently waits. snapshot.hasError
+//     never becomes true, so the old error-based fallback never triggered.
+//   • If ONLINE: use Firestore (shows all students, cloud-synced).
+//     On permission-denied or Firestore error, fall back to Drift.
+//   • Connectivity listener: switches source reactively when network changes.
+//   • Auto-retry Firestore every 15 seconds after an error (non-connectivity
+//     failures like permission-denied during session doc race).
 //   • A source badge tells the teacher which feed they are seeing.
 
 enum _ProofSource { loading, firestore, localBle, error }
@@ -337,18 +343,62 @@ class _ProofListState extends ConsumerState<_ProofList> {
   Timer? _retryTimer;
   bool _firestoreFailed = false;
 
-  // ── Cached streams ─────────────────────────────────────────────────────────
-  // Bug fix: watchFirestoreProofs() and watchProofsForSession() create a NEW
-  // stream object on every call. If we call them inside build(), StreamBuilder
-  // sees a different stream reference on every rebuild and re-subscribes,
-  // creating and immediately destroying Firestore listeners on each Riverpod
-  // provider update. Caching the streams in initState (and resetting the
-  // Firestore stream on retry) fixes this.
-  //
-  // We use late + nullable pattern so we can reset _firestoreStream when
-  // the retry timer fires (needed to get a fresh subscription after a failure).
+  // Connectivity subscription — reacts to WiFi on/off changes.
+  StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
+
   Stream<List<Map<String, dynamic>>>? _firestoreStream;
   Stream<List<AttendanceProof>>? _driftStream;
+
+  @override
+  void initState() {
+    super.initState();
+    // Check connectivity immediately — don't wait for Firestore to fail.
+    // Firestore SDK with offline persistence never errors on network loss;
+    // it just silently waits. We must detect offline state ourselves.
+    _checkConnectivityAndSetSource();
+
+    // Listen for connectivity changes so the source switches automatically
+    // when the teacher's phone gains or loses WiFi during a session.
+    _connectivitySub = Connectivity().onConnectivityChanged.listen(
+      (results) {
+        if (!mounted) return;
+        final hasNet = results.any((r) => r != ConnectivityResult.none);
+        if (hasNet && _firestoreFailed) {
+          // Network returned — try Firestore again.
+          setState(() {
+            _firestoreFailed = false;
+            _firestoreStream = null; // fresh subscription
+            _firestoreError = null;
+          });
+        } else if (!hasNet && !_firestoreFailed) {
+          // Network lost — drop immediately to Drift (BLE ACK path).
+          setState(() {
+            _firestoreFailed = true;
+            _firestoreStream = null;
+            _firestoreError = 'No network — showing BLE-only results';
+          });
+          _retryTimer?.cancel();
+        }
+      },
+    );
+  }
+
+  Future<void> _checkConnectivityAndSetSource() async {
+    try {
+      final results = await Connectivity().checkConnectivity();
+      if (!mounted) return;
+      final hasNet = results.any((r) => r != ConnectivityResult.none);
+      if (!hasNet) {
+        setState(() {
+          _firestoreFailed = true;
+          _firestoreError = 'No network — showing BLE-only results';
+        });
+      }
+    } catch (_) {
+      // Connectivity check failure is non-fatal — proceed with Firestore
+      // and let it error naturally if offline.
+    }
+  }
 
   void _scheduleFirestoreRetry() {
     _retryTimer?.cancel();
@@ -356,8 +406,6 @@ class _ProofListState extends ConsumerState<_ProofList> {
       if (!mounted) return;
       setState(() {
         _firestoreFailed = false;
-        // Null out the cached stream so we create a fresh subscription
-        // next build — the old one may be in an error state.
         _firestoreStream = null;
       });
     });
@@ -366,6 +414,7 @@ class _ProofListState extends ConsumerState<_ProofList> {
   @override
   void dispose() {
     _retryTimer?.cancel();
+    _connectivitySub?.cancel();
     super.dispose();
   }
 

@@ -22,6 +22,8 @@
 
 import 'dart:async';
 
+import 'package:fake_cloud_firestore/fake_cloud_firestore.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mockito/annotations.dart';
 import 'package:mockito/mockito.dart';
@@ -69,6 +71,12 @@ Future<(AttendanceService, AppDatabase, CryptoService)> _buildService({
     crypto: crypto,
     syncEngine: syncEngine,
     currentUserUid: uid,
+    // AttendanceService falls back to FirebaseFirestore.instance when no
+    // firestore is given, which throws core/no-app under the plain test
+    // runner (Firebase.initializeApp() never runs). FakeFirebaseFirestore
+    // is an in-memory implementation that supports the real
+    // collection/doc/set/orderBy/snapshots() chains AttendanceService uses.
+    firestore: FakeFirebaseFirestore(),
   );
   svc.initialize();
 
@@ -79,6 +87,16 @@ Future<(AttendanceService, AppDatabase, CryptoService)> _buildService({
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  // CryptoService.initialize() reads/writes flutter_secure_storage, which has
+  // no real platform implementation under the plain Dart test runner — every
+  // call throws MissingPluginException without this. setMockInitialValues
+  // wires an in-memory map to the plugin's MethodChannel (same pattern as
+  // crypto_service_test.dart). Reset before each test so keys don't leak
+  // across tests that expect a fresh device.
+  setUp(() {
+    FlutterSecureStorage.setMockInitialValues({});
+  });
 
   group('CryptoService — HMAC (Lane A foundation)', () {
     late CryptoService crypto;
@@ -232,6 +250,7 @@ void main() {
         crypto: studentCrypto,
         syncEngine: syncEngine,
         currentUserUid: studentUid,
+        firestore: FakeFirebaseFirestore(),
       );
       studentSvc.initialize();
 
@@ -325,6 +344,7 @@ void main() {
         crypto: studentCrypto,
         syncEngine: syncEngine,
         currentUserUid: studentUid,
+        firestore: FakeFirebaseFirestore(),
       );
       svc.initialize();
 
@@ -358,10 +378,41 @@ void main() {
 
   group('AttendanceService — status stream', () {
     test('status starts as idle', () async {
-      final (svc, _, __) = await _buildService();
+      // Built manually (not via _buildService) because attendanceStatusStream
+      // is a broadcast stream: initialize() emits the idle status
+      // synchronously and broadcast streams don't buffer for late
+      // subscribers. _buildService() calls initialize() before returning,
+      // so by the time a caller attached a listener the only idle event
+      // would already be gone and `.first` would hang forever. Subscribing
+      // before calling initialize() here ensures the listener is in place
+      // when the event fires.
+      final mockMesh = MockMeshService();
+      when(mockMesh.attendancePackets)
+          .thenAnswer((_) => const Stream.empty());
+      when(mockMesh.attendanceAdvertisements)
+          .thenAnswer((_) => const Stream.empty());
 
-      final firstStatus = await svc.attendanceStatusStream.first
-          .timeout(const Duration(seconds: 2));
+      final db = AppDatabase.memory();
+      final crypto = CryptoService();
+      await crypto.initialize();
+
+      final syncEngine = MockFirebaseSyncEngine();
+      when(syncEngine.syncNow()).thenAnswer((_) async {});
+
+      final svc = AttendanceService(
+        mesh: mockMesh,
+        db: db,
+        crypto: crypto,
+        syncEngine: syncEngine,
+        currentUserUid: 'teacher-uid-idle-test',
+        firestore: FakeFirebaseFirestore(),
+      );
+
+      final statusFuture =
+          svc.attendanceStatusStream.first.timeout(const Duration(seconds: 2));
+      svc.initialize();
+
+      final firstStatus = await statusFuture;
 
       expect(firstStatus.type, AttendanceStatusType.idle);
 

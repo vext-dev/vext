@@ -35,12 +35,12 @@
 //    silently swallowed — the UI shows a clear warning when advertising is off.
 //
 // Platform channels (Kotlin ↔ Dart):
-//   MethodChannel "com.example.vext/ble_advertiser"  → BLE peripheral advertising
-//   MethodChannel "com.example.vext/gatt_server"     → GATT server lifecycle
-//   EventChannel  "com.example.vext/gatt_packets"    → incoming GATT packet bytes
-//   MethodChannel "com.example.vext/wake_lock"       → PARTIAL_WAKE_LOCK (Fix 1A)
-//   MethodChannel "com.example.vext/alarm_manager"   → Doze alarm scheduling (Fix 1B)
-//   EventChannel  "com.example.vext/alarm_events"    → Doze alarm fired events (Fix 1B)
+//   MethodChannel "com.vext.vext_app/ble_advertiser"  → BLE peripheral advertising
+//   MethodChannel "com.vext.vext_app/gatt_server"     → GATT server lifecycle
+//   EventChannel  "com.vext.vext_app/gatt_packets"    → incoming GATT packet bytes
+//   MethodChannel "com.vext.vext_app/wake_lock"       → PARTIAL_WAKE_LOCK (Fix 1A)
+//   MethodChannel "com.vext.vext_app/alarm_manager"   → Doze alarm scheduling (Fix 1B)
+//   EventChannel  "com.vext.vext_app/alarm_events"    → Doze alarm fired events (Fix 1B)
 //
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -86,29 +86,29 @@ class BleTransportLayer {
   // ── Platform channels ──────────────────────────────────────────────────────
 
   static const _advertiserChannel =
-      MethodChannel('com.example.vext/ble_advertiser');
+      MethodChannel('com.vext.vext_app/ble_advertiser');
 
   static const _gattServerChannel =
-      MethodChannel('com.example.vext/gatt_server');
+      MethodChannel('com.vext.vext_app/gatt_server');
 
   static const _gattPacketsChannel =
-      EventChannel('com.example.vext/gatt_packets');
+      EventChannel('com.vext.vext_app/gatt_packets');
 
   /// WakeLock channel — keeps the CPU alive while BLE scanning runs.
   /// 'acquireWakeLock' / 'releaseWakeLock' are handled by MainActivity.kt.
   static const _wakeLockChannel =
-      MethodChannel('com.example.vext/wake_lock');
+      MethodChannel('com.vext.vext_app/wake_lock');
 
   /// AlarmManager channel — schedules a one-shot setExactAndAllowWhileIdle
   /// alarm. Fired even in deep Doze; rescheduled from Dart after each receipt.
   static const _alarmManagerChannel =
-      MethodChannel('com.example.vext/alarm_manager');
+      MethodChannel('com.vext.vext_app/alarm_manager');
 
   /// Receives "scanRestart" strings from VextAlarmReceiver when the Doze
   /// alarm fires. BleTransportLayer calls _restartDutyCycle() on each event
   /// and immediately reschedules the next alarm (Fix 1B).
   static const _alarmEventsChannel =
-      EventChannel('com.example.vext/alarm_events');
+      EventChannel('com.vext.vext_app/alarm_events');
 
   // ── BLE UUIDs ─────────────────────────────────────────────────────────────
 
@@ -340,7 +340,12 @@ class BleTransportLayer {
     _peerRssi.clear();
     _peerDevices.clear();
     _peerLastSeen.clear();
-    _activeGattConnections = 0; // reset in case any in-flight ops were abandoned
+    // Do NOT hard-reset _activeGattConnections here. In-flight sendPacketToPeer
+    // calls decrement it in their finally blocks. A hard reset to 0 races with
+    // those decrements and makes the counter go negative, allowing more than
+    // maxConcurrentGattConnections on the next start() call.
+    // The counter will reach 0 naturally as in-flight ops complete.
+    // New ops are blocked by the !_running guard in sendPacketToPeer.
     onPeerCountChanged?.call(0);
   }
 
@@ -391,14 +396,31 @@ class BleTransportLayer {
   ///
   /// Connect → MTU negotiation → discover services → write → disconnect.
   /// Backoff: 100 ms after attempt 1, 200 ms after attempt 2.
+  ///
+  /// [requireAck] — when true, the GATT write uses ATT Write Request
+  ///   (withoutResponse: false). The BLE controller blocks until the peer
+  ///   sends an ATT Attribute Protocol confirmation, guaranteeing the peer's
+  ///   radio received the packet. Use for originated SOS and attendance packets
+  ///   where delivery proof matters more than raw throughput.
+  ///
+  ///   When false (default), the write uses ATT Write Command
+  ///   (withoutResponse: true). The call returns as soon as the local BLE
+  ///   radio accepts the packet — no delivery confirmation from the peer.
+  ///   Use for relay packets where throughput and low latency beat guarantee.
+  ///   False is deliberately the default so existing relay call sites need no changes.
   Future<bool> sendPacketToPeer(
     BluetoothDevice device,
-    List<int> packetBytes,
-  ) async {
+    List<int> packetBytes, {
+    bool requireAck = false,
+  }) async {
+    // Reject new GATT operations when BLE is stopping. Without this guard,
+    // stop() clears peer maps but in-flight ops still complete and decrement
+    // _activeGattConnections — safe. But new ops started AFTER stop() was
+    // called (e.g. from the retry queue firing concurrently) would increment
+    // the counter and never be paired with a peer, leaving it permanently high.
+    if (!_running) return false;
+
     // Guard: drop the send if we are already at the concurrent GATT limit.
-    // This prevents BLE radio saturation (GATT_ERROR 133) on Samsung / Pixel
-    // when broadcastPacket() fires many peers simultaneously.
-    // Return false so the caller knows this peer was not reached.
     if (_activeGattConnections >= AppConstants.maxConcurrentGattConnections) {
       return false;
     }
@@ -450,7 +472,11 @@ class BleTransportLayer {
             return false; // Characteristic gone — no point retrying.
           }
 
-          await writeChar.write(packetBytes, withoutResponse: true);
+          // requireAck=true  → ATT Write Request: peer sends confirmation.
+          //   "return true" means the peer's BLE controller acknowledged receipt.
+          // requireAck=false → ATT Write Command: fire-and-forget.
+          //   "return true" means our local radio queued the packet.
+          await writeChar.write(packetBytes, withoutResponse: !requireAck);
           await device.disconnect();
           return true; // ── Success ──
         } catch (_) {
@@ -476,26 +502,50 @@ class BleTransportLayer {
   /// [_retryMaxAgeMs] ms. Use for SOS packets where delivery is critical.
   /// For attendance/social, the lane-level re-broadcast timers cover retries.
   ///
+  /// [requireAck] — when true, each peer send uses ATT Write Request
+  /// (withoutResponse: false) so the BLE stack waits for peer confirmation.
+  /// Set to true for originated SOS and attendance packets. Leave false for
+  /// relay packets (throughput matters more for relay hops).
+  ///
   /// The public signature stays `void` so existing call sites (MeshService)
   /// need no changes — the async work runs fire-and-forget internally.
   void broadcastPacket(
     List<int> packetBytes, {
     bool retryOnAllFailure = false,
+    bool requireAck = false,
   }) {
-    _broadcastAsync(packetBytes, retryOnAllFailure: retryOnAllFailure).ignore();
+    _broadcastAsync(
+      packetBytes,
+      retryOnAllFailure: retryOnAllFailure,
+      requireAck: requireAck,
+    ).ignore();
   }
 
   Future<void> _broadcastAsync(
     List<int> packetBytes, {
     bool retryOnAllFailure = false,
+    bool requireAck = false,
   }) async {
-    // Guard: stop() may have been called while this Future was queued.
-    // Without this check a stale SOS packet could be enqueued AFTER stop()
-    // cleared _retryQueue, then replayed when start() is called next time.
     if (!_running) return;
 
-    final devices = List<BluetoothDevice>.from(_peerDevices.values)
+    // Select up to 5 peers sorted by RSSI descending (strongest signal first).
+    //
+    // Previous bug: used _peerDevices.values.take(5) which always picked the
+    // first 5 peers by insertion order (oldest peers). With 6+ peers in range,
+    // the most recently discovered peer (potentially the closest) was never
+    // reached. SOS and attendance packets consistently missed newer students
+    // even when they were physically closer to the broadcaster.
+    //
+    // Fix: sort by _peerRssi descending before take(5). Strongest signal =
+    // physically closest = most likely to have a successful GATT connection.
+    // This also improves SOS delivery — the closest relay node is always tried
+    // first, minimising the chance of all 5 slots going to distant peers.
+    final sortedIds = _peerDevices.keys.toList()
+      ..sort((a, b) =>
+          (_peerRssi[b] ?? -100).compareTo(_peerRssi[a] ?? -100));
+    final devices = sortedIds
         .take(5)
+        .map((id) => _peerDevices[id]!)
         .toList();
 
     if (devices.isEmpty) {
@@ -508,7 +558,7 @@ class BleTransportLayer {
 
     // Send to all peers concurrently and collect success flags.
     final results = await Future.wait(
-      devices.map((d) => sendPacketToPeer(d, packetBytes)),
+      devices.map((d) => sendPacketToPeer(d, packetBytes, requireAck: requireAck)),
     );
 
     // If every send failed (all GATT slots busy at the same moment), queue.
@@ -829,6 +879,10 @@ class BleTransportLayer {
 
     for (final entry in pending) {
       // No retryOnAllFailure — avoids infinite re-queue loops.
+      // requireAck is omitted (defaults false) for retry packets because we
+      // cannot recover the original packet type from raw bytes. SOS re-broadcast
+      // from SosService already re-originates with requireAck=true via sendPacket;
+      // the retry queue is a last-resort fallback for connection-failure scenarios.
       _broadcastAsync(entry.bytes).ignore();
     }
   }

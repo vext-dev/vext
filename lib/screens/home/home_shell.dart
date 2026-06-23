@@ -4,7 +4,6 @@ import 'package:go_router/go_router.dart';
 
 import '../../core/app_theme.dart';
 import '../../providers/ble_provider.dart';
-import '../../services/ble_transport_layer.dart';
 
 // ── Tab definition ────────────────────────────────────────────────────────────
 
@@ -112,18 +111,16 @@ class _AppShellScreenState extends ConsumerState<AppShellScreen>
     final bleState = ref.read(bleStateProvider);
     if (!bleState.isActive) return; // BLE not started yet — nothing to restart.
 
-    // Map the current MeshMode back to a ScanDutyMode and re-apply it.
-    // setMode() calls _restartDutyCycle() which cancels the stalled timer
-    // and starts a fresh scan immediately.
-    final transport = ref.read(bleTransportLayerProvider);
-    switch (bleState.mode) {
-      case MeshMode.sosMode:
-        transport.setMode(ScanDutyMode.sos).ignore();
-      case MeshMode.activeSession:
-        transport.setMode(ScanDutyMode.session).ignore();
-      case MeshMode.idle:
-        transport.setMode(ScanDutyMode.idle).ignore();
-    }
+    // Re-apply the effective mode via the lock-aware notifier. This cancels
+    // the stalled duty-cycle timer and starts a fresh scan immediately.
+    // The notifier's _applyEffectiveMode() re-evaluates all active locks and
+    // the UI preference, so the correct mode is restored even if locks changed
+    // while the app was backgrounded.
+    ref.read(bleStateProvider.notifier)
+        .setUiPreference(bleState.mode == MeshMode.idle
+            ? MeshMode.idle
+            : MeshMode.activeSession)
+        .ignore();
     debugPrint('[Shell] App resumed — BLE duty cycle restarted '
         '(mode: ${bleState.mode})');
   }
@@ -141,39 +138,35 @@ class _AppShellScreenState extends ConsumerState<AppShellScreen>
     _applyDutyCycleForTab(index);
   }
 
-  /// Set the BLE scan duty cycle appropriate for the given tab index.
+  /// Set the UI preference for BLE duty cycle based on the active tab.
   ///
-  /// Tabs 0 (Attendance), 1 (Social), 2 (SOS) are active communication lanes.
-  /// They need session duty cycle (500ms/500ms, ~50% scan overlap) for reliable
-  /// BLE packet exchange.
+  /// This now uses the lock-aware [setUiPreference] API instead of calling
+  /// startSession/startIdle directly. The key difference:
   ///
-  /// Tab 3 (Profile) is passive. Revert to idle (1s/30s, ~3%) to conserve
-  /// battery — no BLE mesh communication happens on this tab.
+  ///   OLD: startSession() / startIdle() always applied the mode, overriding
+  ///        any active service lock. Visiting Profile during attendance dropped
+  ///        BLE to idle, breaking packet delivery for the entire class.
   ///
-  /// SAFETY RULE: Never downgrade from SOS mode. If the user triggered an SOS
-  /// and then taps Profile, the emergency duty cycle must be preserved. Only
-  /// downgrade from activeSession → idle, never from sosMode.
+  ///   NEW: setUiPreference() only sets the BASE preference. The BleStateNotifier
+  ///        lock system applies the effective mode = max(all active locks, pref).
+  ///        If a session lock (teacher broadcasting) or SOS lock is held,
+  ///        the BLE stays at session/SOS rate regardless of which tab is open.
   ///
-  /// This is called both on tab tap AND on shell initState so the duty cycle
-  /// is correct from the first frame, regardless of which screen triggers BLE.
+  /// Tab mapping:
+  ///   0 Attendance, 1 Social, 2 SOS → UI preference = activeSession
+  ///   3 Profile                     → UI preference = idle
+  ///
+  /// Profile preference WILL take effect when no service locks are held (no
+  /// active session, no SOS). This is the only correct time to drop to idle.
   void _applyDutyCycleForTab(int index) {
-    final bleState = ref.read(bleStateProvider);
     final notifier = ref.read(bleStateProvider.notifier);
-
-    // Index 0 = Attendance, 1 = Social, 2 = SOS — all need active scanning.
-    // Index 3 = Profile — passive.
     final isActiveLane = index < 3;
 
     if (isActiveLane) {
-      // Boost if currently in idle. Never downgrade from activeSession or sosMode.
-      if (bleState.mode == MeshMode.idle) {
-        notifier.startSession().ignore();
-      }
+      notifier.setUiPreference(MeshMode.activeSession).ignore();
     } else {
-      // Profile tab — revert from session to idle, but NEVER from sosMode.
-      if (bleState.mode == MeshMode.activeSession) {
-        notifier.startIdle().ignore();
-      }
+      // Profile: prefer idle, but service locks will override if needed.
+      notifier.setUiPreference(MeshMode.idle).ignore();
     }
   }
 
@@ -200,8 +193,12 @@ class _AppShellScreenState extends ConsumerState<AppShellScreen>
           style: TextStyle(
             color: _AppShellColors.navyTitle,
             fontSize: 22,
-            fontWeight: FontWeight.w800,
-            letterSpacing: 4,
+            fontWeight: FontWeight.w900,
+            letterSpacing: 5,
+            shadows: [
+              Shadow(color: Color(0x5506B6D4), blurRadius: 14),
+              Shadow(color: Color(0x2822D3EE), blurRadius: 28),
+            ],
           ),
         ),
         actions: [
@@ -399,38 +396,53 @@ class _BleStatusIndicator extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final dotColor = isActive
+    final dotColor =
+        isActive ? _AppShellColors.bleActive : _AppShellColors.bleInactive;
+    final label = isActive ? 'MESH ON' : 'MESH OFF';
+    final labelColor = isActive
         ? _AppShellColors.bleActive
-        : _AppShellColors.bleInactive;
+        : _AppShellColors.bleInactiveLabel;
 
-    final label = isActive ? 'BLE On' : 'BLE Off';
-
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        // Pulsing dot when active
-        isActive
-            ? _PulsingDot(color: dotColor)
-            : Container(
-                width: 8,
-                height: 8,
-                decoration: BoxDecoration(
-                  color: dotColor,
-                  shape: BoxShape.circle,
-                ),
-              ),
-        const SizedBox(width: 6),
-        Text(
-          label,
-          style: TextStyle(
-            color: isActive
-                ? _AppShellColors.bleActive
-                : _AppShellColors.bleInactiveLabel,
-            fontSize: 12,
-            fontWeight: FontWeight.w500,
-          ),
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 400),
+      curve: Curves.easeInOut,
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+      decoration: BoxDecoration(
+        color: isActive
+            ? _AppShellColors.bleActive.withValues(alpha: 0.10)
+            : _AppShellColors.bleInactive.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(
+          color: dotColor.withValues(alpha: isActive ? 0.35 : 0.20),
+          width: 1,
         ),
-      ],
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Pulsing dot when active, static when not
+          isActive
+              ? _PulsingDot(color: dotColor)
+              : Container(
+                  width: 6,
+                  height: 6,
+                  decoration: BoxDecoration(
+                    color: dotColor,
+                    shape: BoxShape.circle,
+                  ),
+                ),
+          const SizedBox(width: 6),
+          Text(
+            label,
+            style: TextStyle(
+              color: labelColor,
+              fontSize: 10,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 1.0,
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -505,21 +517,21 @@ class _PulsingDotState extends State<_PulsingDot>
 
 abstract class _AppShellColors {
   // AppBar
-  static const Color navyBackground = Color(0xFF0D1B2A);
-  static const Color navyTitle = Color(0xFF3B82F6); // sky blue
+  static const Color navyBackground = Color(0xFF0A1520); // matches surfaceColor
+  static const Color navyTitle = Color(0xFF22D3EE); // signal cyan accent
 
   // Bottom nav
-  static const Color navBackground = Color(0xFF0F2035);
-  static const Color navBorder = Color(0xFF1A3352);
-  static const Color selectedItem = Color(0xFF38BDF8); // sky blue
-  static const Color unselectedItem = Color(0xFF4D7096);
+  static const Color navBackground = Color(0xFF0C1828);
+  static const Color navBorder = Color(0xFF0D2646);
+  static const Color selectedItem = Color(0xFF22D3EE); // signal cyan
+  static const Color unselectedItem = Color(0xFF3C5870);
 
   // SOS
-  static const Color sos = Color(0xFFEF4444);
-  static const Color sosInactive = Color(0xFFEF4444); // red even when inactive
+  static const Color sos = Color(0xFFFF3B30); // Apple emergency red
+  static const Color sosInactive = Color(0xFFFF3B30); // red even when inactive
 
-  // BLE
-  static const Color bleActive = Color(0xFF22C55E); // green
-  static const Color bleInactive = Color(0xFF4B5563); // grey
-  static const Color bleInactiveLabel = Color(0xFF6B7280);
+  // BLE / Mesh
+  static const Color bleActive = Color(0xFF10D979); // electric mesh-green
+  static const Color bleInactive = Color(0xFF374060);
+  static const Color bleInactiveLabel = Color(0xFF4A6280);
 }

@@ -19,6 +19,12 @@ import 'package:drift/drift.dart';
 // Written when a student's BLE advertisement is detected by a teacher node
 // within RSSI threshold. One row per student per session, pending cloud sync.
 //
+// Schema v2: added uniqueKeys({sessionId, studentUid}) — DB-level guard
+// against duplicate proofs for the same student in the same session.
+// The service-layer _inProgressSessionIds set (added in Bug 1 fix) prevents
+// duplicates at runtime, but the unique constraint is the long-term backstop
+// for any logic error that might bypass that guard in future milestones.
+//
 class AttendanceProofs extends Table {
   /// UUID v4 — packet ID from the mesh packet that carried this proof.
   TextColumn get id => text().withLength(min: 36, max: 36)();
@@ -49,6 +55,15 @@ class AttendanceProofs extends Table {
 
   @override
   Set<Column> get primaryKey => {id};
+
+  /// Enforce one proof per student per session at the DB level.
+  /// If a duplicate (sessionId, studentUid) pair is inserted, Drift raises
+  /// a unique constraint violation — caught by upsertAttendanceProof which
+  /// uses insertOnConflictUpdate (replaces the existing row with latest data).
+  @override
+  List<Set<Column>> get uniqueKeys => [
+        {sessionId, studentUid},
+      ];
 }
 
 // ── 2. MessageRecords ─────────────────────────────────────────────────────────

@@ -12,7 +12,7 @@ plugins {
 }
 
 android {
-    namespace = "com.example.vext"
+    namespace = "com.vext.vext_app"
 
     // ── SDK versions ────────────────────────────────────────────────────────
     // compileSdk 36 required by flutter_blue_plus_android and geolocator_android.
@@ -35,7 +35,7 @@ android {
         // applicationId must match the package name registered in Firebase Console.
         // If you registered a different package (e.g. com.vext.app), update both
         // this value AND the Firebase project's Android app configuration.
-        applicationId = "com.example.vext"
+        applicationId = "com.vext.vext_app"
 
         // minSdk 21 = Android 5.0 Lollipop (minimum for BLE + foreground service).
         // Hardcoded to 21 — do NOT use flutter.minSdkVersion here. Flutter's default

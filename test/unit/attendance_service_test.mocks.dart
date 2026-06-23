@@ -3,11 +3,12 @@
 // Do not manually edit this file.
 
 // ignore_for_file: no_leading_underscores_for_library_prefixes
-import 'dart:async' as _i3;
+import 'dart:async' as _i4;
+import 'dart:ui' as _i3;
 
 import 'package:mockito/mockito.dart' as _i1;
-import 'package:vext/core/proto/mesh_packet.dart' as _i4;
-import 'package:vext/services/firebase_sync_engine.dart' as _i5;
+import 'package:vext/core/proto/mesh_packet.dart' as _i5;
+import 'package:vext/services/firebase_sync_engine.dart' as _i6;
 import 'package:vext/services/mesh_service.dart' as _i2;
 
 // ignore_for_file: type=lint
@@ -28,51 +29,61 @@ import 'package:vext/services/mesh_service.dart' as _i2;
 /// See the documentation for Mockito's code generation for more information.
 class MockMeshService extends _i1.Mock implements _i2.MeshService {
   @override
-  _i3.Stream<_i4.MeshPacket> get attendancePackets => (super.noSuchMethod(
+  set onSosPacketReceived(_i3.VoidCallback? _onSosPacketReceived) =>
+      super.noSuchMethod(
+        Invocation.setter(
+          #onSosPacketReceived,
+          _onSosPacketReceived,
+        ),
+        returnValueForMissingStub: null,
+      );
+
+  @override
+  _i4.Stream<_i5.MeshPacket> get attendancePackets => (super.noSuchMethod(
         Invocation.getter(#attendancePackets),
-        returnValue: _i3.Stream<_i4.MeshPacket>.empty(),
-        returnValueForMissingStub: _i3.Stream<_i4.MeshPacket>.empty(),
-      ) as _i3.Stream<_i4.MeshPacket>);
+        returnValue: _i4.Stream<_i5.MeshPacket>.empty(),
+        returnValueForMissingStub: _i4.Stream<_i5.MeshPacket>.empty(),
+      ) as _i4.Stream<_i5.MeshPacket>);
 
   @override
-  _i3.Stream<_i4.MeshPacket> get messagePackets => (super.noSuchMethod(
+  _i4.Stream<_i5.MeshPacket> get messagePackets => (super.noSuchMethod(
         Invocation.getter(#messagePackets),
-        returnValue: _i3.Stream<_i4.MeshPacket>.empty(),
-        returnValueForMissingStub: _i3.Stream<_i4.MeshPacket>.empty(),
-      ) as _i3.Stream<_i4.MeshPacket>);
+        returnValue: _i4.Stream<_i5.MeshPacket>.empty(),
+        returnValueForMissingStub: _i4.Stream<_i5.MeshPacket>.empty(),
+      ) as _i4.Stream<_i5.MeshPacket>);
 
   @override
-  _i3.Stream<_i4.MeshPacket> get sosPackets => (super.noSuchMethod(
+  _i4.Stream<_i5.MeshPacket> get sosPackets => (super.noSuchMethod(
         Invocation.getter(#sosPackets),
-        returnValue: _i3.Stream<_i4.MeshPacket>.empty(),
-        returnValueForMissingStub: _i3.Stream<_i4.MeshPacket>.empty(),
-      ) as _i3.Stream<_i4.MeshPacket>);
+        returnValue: _i4.Stream<_i5.MeshPacket>.empty(),
+        returnValueForMissingStub: _i4.Stream<_i5.MeshPacket>.empty(),
+      ) as _i4.Stream<_i5.MeshPacket>);
 
   @override
-  _i3.Stream<_i4.MeshPacket> get ackPackets => (super.noSuchMethod(
+  _i4.Stream<_i5.MeshPacket> get ackPackets => (super.noSuchMethod(
         Invocation.getter(#ackPackets),
-        returnValue: _i3.Stream<_i4.MeshPacket>.empty(),
-        returnValueForMissingStub: _i3.Stream<_i4.MeshPacket>.empty(),
-      ) as _i3.Stream<_i4.MeshPacket>);
+        returnValue: _i4.Stream<_i5.MeshPacket>.empty(),
+        returnValueForMissingStub: _i4.Stream<_i5.MeshPacket>.empty(),
+      ) as _i4.Stream<_i5.MeshPacket>);
 
   @override
-  _i3.Stream<_i2.AttendanceAdvertisement> get attendanceAdvertisements =>
+  _i4.Stream<_i2.AttendanceAdvertisement> get attendanceAdvertisements =>
       (super.noSuchMethod(
         Invocation.getter(#attendanceAdvertisements),
-        returnValue: _i3.Stream<_i2.AttendanceAdvertisement>.empty(),
+        returnValue: _i4.Stream<_i2.AttendanceAdvertisement>.empty(),
         returnValueForMissingStub:
-            _i3.Stream<_i2.AttendanceAdvertisement>.empty(),
-      ) as _i3.Stream<_i2.AttendanceAdvertisement>);
+            _i4.Stream<_i2.AttendanceAdvertisement>.empty(),
+      ) as _i4.Stream<_i2.AttendanceAdvertisement>);
 
   @override
-  _i3.Future<void> initialize() => (super.noSuchMethod(
+  _i4.Future<void> initialize() => (super.noSuchMethod(
         Invocation.method(
           #initialize,
           [],
         ),
-        returnValue: _i3.Future<void>.value(),
-        returnValueForMissingStub: _i3.Future<void>.value(),
-      ) as _i3.Future<void>);
+        returnValue: _i4.Future<void>.value(),
+        returnValueForMissingStub: _i4.Future<void>.value(),
+      ) as _i4.Future<void>);
 
   @override
   void dispose() => super.noSuchMethod(
@@ -84,30 +95,30 @@ class MockMeshService extends _i1.Mock implements _i2.MeshService {
       );
 
   @override
-  _i3.Future<void> sendPacket(_i4.MeshPacket? packet) => (super.noSuchMethod(
+  _i4.Future<void> sendPacket(_i5.MeshPacket? packet) => (super.noSuchMethod(
         Invocation.method(
           #sendPacket,
           [packet],
         ),
-        returnValue: _i3.Future<void>.value(),
-        returnValueForMissingStub: _i3.Future<void>.value(),
-      ) as _i3.Future<void>);
+        returnValue: _i4.Future<void>.value(),
+        returnValueForMissingStub: _i4.Future<void>.value(),
+      ) as _i4.Future<void>);
 }
 
 /// A class which mocks [FirebaseSyncEngine].
 ///
 /// See the documentation for Mockito's code generation for more information.
 class MockFirebaseSyncEngine extends _i1.Mock
-    implements _i5.FirebaseSyncEngine {
+    implements _i6.FirebaseSyncEngine {
   @override
-  _i3.Future<void> initialize() => (super.noSuchMethod(
+  _i4.Future<void> initialize() => (super.noSuchMethod(
         Invocation.method(
           #initialize,
           [],
         ),
-        returnValue: _i3.Future<void>.value(),
-        returnValueForMissingStub: _i3.Future<void>.value(),
-      ) as _i3.Future<void>);
+        returnValue: _i4.Future<void>.value(),
+        returnValueForMissingStub: _i4.Future<void>.value(),
+      ) as _i4.Future<void>);
 
   @override
   void dispose() => super.noSuchMethod(
@@ -119,12 +130,12 @@ class MockFirebaseSyncEngine extends _i1.Mock
       );
 
   @override
-  _i3.Future<void> syncNow() => (super.noSuchMethod(
+  _i4.Future<void> syncNow() => (super.noSuchMethod(
         Invocation.method(
           #syncNow,
           [],
         ),
-        returnValue: _i3.Future<void>.value(),
-        returnValueForMissingStub: _i3.Future<void>.value(),
-      ) as _i3.Future<void>);
+        returnValue: _i4.Future<void>.value(),
+        returnValueForMissingStub: _i4.Future<void>.value(),
+      ) as _i4.Future<void>);
 }

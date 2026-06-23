@@ -76,6 +76,9 @@ context.handle(_syncedMeta, synced.isAcceptableOrUnknown(data['synced']!, _synce
 }
 @override
 Set<GeneratedColumn> get $primaryKey => {id};
+@override
+List<Set<GeneratedColumn>> get uniqueKeys => [{sessionId, studentUid},
+];
 @override AttendanceProof map(Map<String, dynamic> data, {String? tablePrefix})  {
 final effectivePrefix = tablePrefix != null ? '$tablePrefix.' : '';return AttendanceProof(id: attachedDatabase.typeMapping.read(DriftSqlType.string, data['${effectivePrefix}id'])!, sessionId: attachedDatabase.typeMapping.read(DriftSqlType.string, data['${effectivePrefix}session_id'])!, studentUid: attachedDatabase.typeMapping.read(DriftSqlType.string, data['${effectivePrefix}student_uid'])!, hmacToken: attachedDatabase.typeMapping.read(DriftSqlType.string, data['${effectivePrefix}hmac_token'])!, rssi: attachedDatabase.typeMapping.read(DriftSqlType.int, data['${effectivePrefix}rssi'])!, timestamp: attachedDatabase.typeMapping.read(DriftSqlType.dateTime, data['${effectivePrefix}timestamp'])!, gpsLat: attachedDatabase.typeMapping.read(DriftSqlType.double, data['${effectivePrefix}gps_lat']), gpsLng: attachedDatabase.typeMapping.read(DriftSqlType.double, data['${effectivePrefix}gps_lng']), synced: attachedDatabase.typeMapping.read(DriftSqlType.bool, data['${effectivePrefix}synced'])!, );
 }

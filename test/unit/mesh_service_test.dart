@@ -26,7 +26,11 @@ class _FakeBleTransport extends BleTransportLayer {
   final List<List<int>> broadcasts = [];
 
   @override
-  void broadcastPacket(List<int> packetBytes) {
+  void broadcastPacket(
+    List<int> packetBytes, {
+    bool requireAck = false,
+    bool retryOnAllFailure = false,
+  }) {
     broadcasts.add(List<int>.from(packetBytes));
   }
 }

@@ -29,13 +29,13 @@ import '../../../providers/providers.dart';
 import '../sos_service.dart';
 import '../widgets/sos_hold_button.dart';
 
-// Convenience colors — mirror home_shell.dart AppShellColors
-const _kRed = Color(0xFFEF4444);
-const _kRedDim = Color(0x26EF4444); // 15% opacity
-const _kSurface = Color(0xFF0F1923);
-const _kCard = Color(0xFF1A2535);
-const _kTextPrimary = Color(0xFFE2E8F0);
-const _kTextSecondary = Color(0xFF8BA3C0);
+// Convenience colors — keep in sync with AppTheme + _AppShellColors
+const _kRed = Color(0xFFFF3B30); // Apple emergency red
+const _kRedDim = Color(0x26FF3B30); // 15% opacity
+const _kSurface = Color(0xFF060E1A); // matches AppTheme.backgroundColor
+const _kCard = Color(0xFF0F1D30); // matches AppTheme.cardColor
+const _kTextPrimary = Color(0xFFEDF4FF); // matches AppTheme.primaryTextColor
+const _kTextSecondary = Color(0xFF7EA8C8); // matches AppTheme.secondaryTextColor
 
 // ── SosScreen ─────────────────────────────────────────────────────────────────
 
@@ -128,58 +128,98 @@ class _SosScreenState extends ConsumerState<SosScreen> {
     // Incoming alerts from the provider — persists across tab switches.
     final incoming = ref.watch(incomingSosProvider);
 
+    // isActive: SOS is transmitting (covers both 'active' and 'gpsWarning').
+    // isGpsWarning: SOS active but GPS was unavailable — show the GPS banner
+    //   INSTEAD OF (not in addition to) the standard active banner, since the
+    //   GPS banner already communicates that SOS is in progress.
     final isActive = _status.type != SosStatusType.idle;
     final isGpsWarning = _status.type == SosStatusType.gpsWarning;
     final serviceError = sosAsync.hasError;
 
     return Scaffold(
       backgroundColor: _kSurface,
-      body: SafeArea(
-        child: serviceError
-            ? _ServiceErrorView(error: sosAsync.error.toString())
-            : Column(
-                children: [
-                  // ── Status banner ──────────────────────────────────────────
-                  if (isActive) _ActiveBanner(status: _status),
-                  if (isGpsWarning) _GpsWarningBanner(status: _status),
-
-                  // ── Button area ────────────────────────────────────────────
-                  Expanded(
-                    flex: 5,
-                    child: Center(
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          SosHoldButton(
-                            onTriggered: _onTriggered,
-                            onCancel: _onCancel,
-                            isActive: isActive,
-                          ),
-                          const SizedBox(height: 24),
-                          AnimatedSwitcher(
-                            duration: const Duration(milliseconds: 300),
-                            child: isActive
-                                ? const _RelayingIndicator()
-                                : const _HoldInstruction(),
-                          ),
-                        ],
-                      ),
+      body: Stack(
+        children: [
+          // ── Active SOS radial red overlay ──────────────────────────────────
+          Positioned.fill(
+            child: IgnorePointer(
+              child: AnimatedOpacity(
+                duration: const Duration(milliseconds: 700),
+                opacity: isActive ? 1.0 : 0.0,
+                child: const DecoratedBox(
+                  decoration: BoxDecoration(
+                    gradient: RadialGradient(
+                      center: Alignment(0.0, -0.25),
+                      radius: 1.1,
+                      colors: [
+                        Color(0x22FF3B30),
+                        Color(0x00FF3B30),
+                      ],
                     ),
                   ),
-
-                  // ── Incoming alerts ────────────────────────────────────────
-                  if (incoming.isNotEmpty)
-                    Expanded(
-                      flex: 4,
-                      child: _IncomingAlertList(alerts: incoming),
-                    )
-                  else
-                    const Expanded(
-                      flex: 4,
-                      child: _EmptyIncoming(),
-                    ),
-                ],
+                ),
               ),
+            ),
+          ),
+
+          // ── Main content ───────────────────────────────────────────────────
+          SafeArea(
+            child: serviceError
+                ? _ServiceErrorView(error: sosAsync.error.toString())
+                : Column(
+                    children: [
+                      // ── Status banner ──────────────────────────────────────
+                      // Show GPS warning banner when GPS is unavailable — it
+                      // already communicates SOS is active, so the standard
+                      // active banner is suppressed to avoid double-stacking.
+                      // Show standard active banner only when GPS succeeded.
+                      if (isGpsWarning)
+                        _GpsWarningBanner(status: _status)
+                      else if (isActive)
+                        _ActiveBanner(status: _status),
+
+                      // ── Button area ────────────────────────────────────────
+                      Expanded(
+                        flex: 5,
+                        child: Center(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              SosHoldButton(
+                                onTriggered: _onTriggered,
+                                onCancel: _onCancel,
+                                isActive: isActive,
+                              ),
+                              const SizedBox(height: 28),
+                              AnimatedSwitcher(
+                                duration: const Duration(milliseconds: 300),
+                                child: isActive
+                                    ? const _RelayingIndicator()
+                                    : const _HoldInstruction(),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+
+                      // ── Section divider ────────────────────────────────────
+                      _AlertsSectionHeader(hasAlerts: incoming.isNotEmpty),
+
+                      // ── Incoming alerts ────────────────────────────────────
+                      if (incoming.isNotEmpty)
+                        Expanded(
+                          flex: 4,
+                          child: _IncomingAlertList(alerts: incoming),
+                        )
+                      else
+                        const Expanded(
+                          flex: 4,
+                          child: _EmptyIncoming(),
+                        ),
+                    ],
+                  ),
+          ),
+        ],
       ),
     );
   }
@@ -255,31 +295,99 @@ class _ActiveBannerState extends State<_ActiveBanner>
 
 // ── GPS warning banner ────────────────────────────────────────────────────────
 
-class _GpsWarningBanner extends StatelessWidget {
+// GPS warning banner — shown INSTEAD of _ActiveBanner when GPS was unavailable.
+// It communicates both "SOS is active" (red left border + pulsing dot inherited
+// from _ActiveBanner's design language) AND "GPS unavailable" (amber warning row)
+// in a single banner so the user is not overwhelmed by two stacked banners.
+class _GpsWarningBanner extends StatefulWidget {
   const _GpsWarningBanner({required this.status});
   final SosStatus status;
 
   @override
+  State<_GpsWarningBanner> createState() => _GpsWarningBannerState();
+}
+
+class _GpsWarningBannerState extends State<_GpsWarningBanner>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _ctrl;
+  late final Animation<double> _pulse;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(
+        vsync: this, duration: const Duration(milliseconds: 800));
+    _pulse = Tween<double>(begin: 0.4, end: 1.0).animate(_ctrl);
+    _ctrl.repeat(reverse: true);
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 20),
-      color: const Color(0xFF422006),
-      child: Row(
-        children: [
-          const Icon(Icons.location_off, color: Color(0xFFFBBF24), size: 16),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              status.message ?? 'GPS unavailable — no location attached',
-              style: const TextStyle(
-                color: Color(0xFFFBBF24),
-                fontSize: 12,
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        // SOS-active row (same as _ActiveBanner)
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 20),
+          color: _kRedDim,
+          child: Row(
+            children: [
+              FadeTransition(
+                opacity: _pulse,
+                child: Container(
+                  width: 10,
+                  height: 10,
+                  decoration: const BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: _kRed,
+                  ),
+                ),
               ),
-            ),
+              const SizedBox(width: 12),
+              const Expanded(
+                child: Text(
+                  'SOS ACTIVE — RELAYING ON MESH',
+                  style: TextStyle(
+                    color: _kRed,
+                    fontWeight: FontWeight.w700,
+                    fontSize: 13,
+                    letterSpacing: 1.2,
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
           ),
-        ],
-      ),
+        ),
+        // GPS warning row below
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(vertical: 7, horizontal: 20),
+          color: const Color(0xFF422006),
+          child: Row(
+            children: [
+              const Icon(Icons.location_off, color: Color(0xFFFBBF24), size: 15),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  widget.status.message ?? 'GPS unavailable — no location attached',
+                  style: const TextStyle(
+                    color: Color(0xFFFBBF24),
+                    fontSize: 12,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
     );
   }
 }
@@ -508,27 +616,197 @@ class _IncomingAlertCardState extends State<_IncomingAlertCard> {
   }
 }
 
-// ── Empty incoming state ──────────────────────────────────────────────────────
+// ── Alerts section header ─────────────────────────────────────────────────────
 
-class _EmptyIncoming extends StatelessWidget {
+class _AlertsSectionHeader extends StatelessWidget {
+  const _AlertsSectionHeader({required this.hasAlerts});
+  final bool hasAlerts;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 0, 20, 0),
+      child: Row(
+        children: [
+          Container(width: 3, height: 14, color: _kRed.withValues(alpha: 0.6)),
+          const SizedBox(width: 8),
+          const Text(
+            'INCOMING ALERTS',
+            style: TextStyle(
+              color: _kTextSecondary,
+              fontSize: 10,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 1.8,
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Container(height: 1, color: const Color(0xFF1A2D42)),
+          ),
+          if (hasAlerts) ...[
+            const SizedBox(width: 8),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+              decoration: BoxDecoration(
+                color: _kRed.withValues(alpha: 0.15),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: _kRed.withValues(alpha: 0.3)),
+              ),
+              child: const Text(
+                'LIVE',
+                style: TextStyle(
+                  color: _kRed,
+                  fontSize: 9,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: 1.0,
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+// ── Empty incoming state — animated radar ────────────────────────────────────
+
+class _EmptyIncoming extends StatefulWidget {
   const _EmptyIncoming();
+
+  @override
+  State<_EmptyIncoming> createState() => _EmptyIncomingState();
+}
+
+class _EmptyIncomingState extends State<_EmptyIncoming>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _ctrl;
+  late final Animation<double> _anim;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 2200),
+    )..repeat();
+    _anim = Tween<double>(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(parent: _ctrl, curve: Curves.easeOut),
+    );
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
     return Center(
       child: Column(
         mainAxisSize: MainAxisSize.min,
-        children: const [
-          Icon(Icons.sensors, color: Color(0xFF2D3F55), size: 36),
-          SizedBox(height: 8),
-          Text(
+        children: [
+          // Animated radar ping
+          SizedBox(
+            width: 64,
+            height: 64,
+            child: AnimatedBuilder(
+              animation: _anim,
+              builder: (context, _) =>
+                  CustomPaint(painter: _RadarPainter(_anim.value)),
+            ),
+          ),
+          const SizedBox(height: 14),
+          const Text(
+            'SCANNING MESH',
+            style: TextStyle(
+              color: Color(0xFF2A4A6B),
+              fontSize: 10,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 2.2,
+            ),
+          ),
+          const SizedBox(height: 5),
+          const Text(
             'No SOS alerts received',
-            style: TextStyle(color: Color(0xFF4D6480), fontSize: 13),
+            style: TextStyle(color: Color(0xFF4D6480), fontSize: 12),
           ),
         ],
       ),
     );
   }
+}
+
+// ── Radar painter ─────────────────────────────────────────────────────────────
+
+class _RadarPainter extends CustomPainter {
+  const _RadarPainter(this.progress);
+
+  final double progress; // 0.0 → 1.0
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = Offset(size.width / 2, size.height / 2);
+    final maxRadius = size.width / 2;
+
+    // Static outer ring
+    canvas.drawCircle(
+      center,
+      maxRadius,
+      Paint()
+        ..color = const Color(0xFF1A3352)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.2,
+    );
+
+    // Inner static ring
+    canvas.drawCircle(
+      center,
+      maxRadius * 0.55,
+      Paint()
+        ..color = const Color(0xFF1A3352).withValues(alpha: 0.6)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 0.8,
+    );
+
+    // Center node
+    canvas.drawCircle(
+      center,
+      3.5,
+      Paint()..color = const Color(0xFF3B82F6).withValues(alpha: 0.70),
+    );
+
+    // Cross-hairs
+    final crossPaint = Paint()
+      ..color = const Color(0xFF1E3352)
+      ..strokeWidth = 0.7;
+    canvas.drawLine(
+        Offset(center.dx, center.dy - maxRadius),
+        Offset(center.dx, center.dy + maxRadius),
+        crossPaint);
+    canvas.drawLine(
+        Offset(center.dx - maxRadius, center.dy),
+        Offset(center.dx + maxRadius, center.dy),
+        crossPaint);
+
+    // Expanding ping ring
+    final pingRadius = maxRadius * progress;
+    final pingOpacity = (1.0 - progress) * 0.65;
+    if (pingOpacity > 0.01) {
+      canvas.drawCircle(
+        center,
+        pingRadius,
+        Paint()
+          ..color = const Color(0xFF3B82F6).withValues(alpha: pingOpacity)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.5,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(_RadarPainter old) => old.progress != progress;
 }
 
 // ── Service error fallback ────────────────────────────────────────────────────

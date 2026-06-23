@@ -54,8 +54,12 @@ final sosServiceProvider = FutureProvider<SosService>((ref) async {
     db: db,
     syncEngine: syncEngine,
     currentUserUid: uid,
-    onSosActivated: () => bleNotifier.startSos(),
-    onSosCancelled: () => bleNotifier.startSession(),
+    // acquireSosLock: boosts BLE to 100ms/100ms immediately.
+    // releaseSosLock: reverts to the next highest lock (session or UI pref).
+    // This replaces the old startSos/startSession pattern which always
+    // dropped to session mode on cancel regardless of prior state.
+    onSosActivated: () => bleNotifier.acquireSosLock(),
+    onSosCancelled: () => bleNotifier.releaseSosLock(),
   );
 
   service.initialize();

@@ -27,6 +27,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../lanes/attendance/attendance_service.dart';
 import 'auth_service_provider.dart';
+import 'ble_provider.dart';
 import 'crypto_service_provider.dart';
 import 'database_provider.dart';
 import 'firebase_sync_engine_provider.dart';
@@ -55,12 +56,19 @@ final attendanceServiceProvider =
   final crypto     = await ref.watch(cryptoServiceProvider.future);
   final syncEngine = await ref.watch(firebaseSyncEngineProvider.future);
 
+  // BLE session lock callbacks — injected so AttendanceService stays
+  // decoupled from Riverpod. ref.read (not ref.watch) — bleStateNotifier is
+  // a stable singleton and we don't want provider recreation from BLE changes.
+  final bleNotifier = ref.read(bleStateProvider.notifier);
+
   final service = AttendanceService(
     mesh: mesh,
     db: db,
     crypto: crypto,
     syncEngine: syncEngine,
     currentUserUid: uid,
+    onSessionLockAcquired: () => bleNotifier.acquireSessionLock(),
+    onSessionLockReleased: () => bleNotifier.releaseSessionLock(),
   );
 
   service.initialize();

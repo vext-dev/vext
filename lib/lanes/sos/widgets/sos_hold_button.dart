@@ -52,12 +52,13 @@ class _SosHoldButtonState extends State<SosHoldButton>
     with TickerProviderStateMixin {
   late final AnimationController _ringController;
   late final AnimationController _pulseController;
+  late final AnimationController _rippleController;
   late final Animation<double> _pulseAnim;
   bool _triggered = false;
 
-  static const Color _red = Color(0xFFEF4444);
-  static const Color _darkRed = Color(0xFFB91C1C);
-  static const Color _bgRing = Color(0xFF1E293B);
+  static const Color _red = Color(0xFFFF3B30); // Apple emergency red
+  static const Color _darkRed = Color(0xFFCC1500); // pressed/shadow shade
+  static const Color _bgRing = Color(0xFF0F1D30); // matches new cardColor
 
   @override
   void initState() {
@@ -73,8 +74,14 @@ class _SosHoldButtonState extends State<SosHoldButton>
       duration: const Duration(milliseconds: 900),
     );
 
-    _pulseAnim = Tween<double>(begin: 1.0, end: 1.12).animate(
+    _pulseAnim = Tween<double>(begin: 1.0, end: 1.10).animate(
       CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
+    );
+
+    // 2400ms ripple cycle — 3 rings staggered at 1/3 offsets each.
+    _rippleController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 2400),
     );
   }
 
@@ -83,9 +90,12 @@ class _SosHoldButtonState extends State<SosHoldButton>
     super.didUpdateWidget(old);
     if (widget.isActive && !old.isActive) {
       _pulseController.repeat(reverse: true);
+      _rippleController.repeat();
     } else if (!widget.isActive && old.isActive) {
       _pulseController.stop();
       _pulseController.value = 0;
+      _rippleController.stop();
+      _rippleController.reset();
       _triggered = false;
     }
   }
@@ -115,7 +125,28 @@ class _SosHoldButtonState extends State<SosHoldButton>
   void dispose() {
     _ringController.dispose();
     _pulseController.dispose();
+    _rippleController.dispose();
     super.dispose();
+  }
+
+  /// Builds a single expanding ripple ring.
+  /// [t] is 0.0 (just appeared at button surface) → 1.0 (fully expanded + gone).
+  Widget _buildRippleRing(double baseSize, double t) {
+    final clampedT = t.clamp(0.0, 1.0);
+    final ringSize = baseSize * (1.0 + clampedT * 0.85);
+    final opacity = (1.0 - clampedT) * 0.45;
+    if (opacity < 0.01) return const SizedBox.shrink();
+    return Container(
+      width: ringSize,
+      height: ringSize,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        border: Border.all(
+          color: _red.withValues(alpha: opacity),
+          width: 1.5,
+        ),
+      ),
+    );
   }
 
   @override
@@ -123,40 +154,62 @@ class _SosHoldButtonState extends State<SosHoldButton>
     final size = widget.size;
 
     if (widget.isActive) {
-      // ── Cancel mode — pulsing red button ──────────────────────────────────
-      return ScaleTransition(
-        scale: _pulseAnim,
-        child: GestureDetector(
-          onTap: widget.onCancel,
-          child: Container(
-            width: size,
-            height: size,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              color: _red,
-              boxShadow: [
-                BoxShadow(
-                  color: _red.withValues(alpha: 0.5),
-                  blurRadius: 24,
-                  spreadRadius: 4,
-                ),
+      // ── Cancel mode — pulsing red button with expanding ripple rings ───────
+      return AnimatedBuilder(
+        animation: _rippleController,
+        builder: (context, child) {
+          final v = _rippleController.value;
+          return SizedBox(
+            // Extra space so ripple rings don't get clipped
+            width: size * 2.0,
+            height: size * 2.0,
+            child: Stack(
+              alignment: Alignment.center,
+              children: [
+                // 3 staggered rings — offset by 1/3 of the cycle each
+                _buildRippleRing(size, v),
+                _buildRippleRing(size, (v + 0.333) % 1.0),
+                _buildRippleRing(size, (v + 0.666) % 1.0),
+                // The cancel button itself
+                child!,
               ],
             ),
-            child: const Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Icon(Icons.close, color: Colors.white, size: 32),
-                SizedBox(height: 4),
-                Text(
-                  'CANCEL',
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontSize: 13,
-                    fontWeight: FontWeight.w800,
-                    letterSpacing: 1.5,
+          );
+        },
+        child: ScaleTransition(
+          scale: _pulseAnim,
+          child: GestureDetector(
+            onTap: widget.onCancel,
+            child: Container(
+              width: size,
+              height: size,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: _red,
+                boxShadow: [
+                  BoxShadow(
+                    color: _red.withValues(alpha: 0.55),
+                    blurRadius: 28,
+                    spreadRadius: 6,
                   ),
-                ),
-              ],
+                ],
+              ),
+              child: const Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(Icons.close, color: Colors.white, size: 32),
+                  SizedBox(height: 4),
+                  Text(
+                    'CANCEL',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: 1.5,
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
         ),

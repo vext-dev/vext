@@ -133,12 +133,16 @@ class AttendanceService {
     required FirebaseSyncEngine syncEngine,
     required String currentUserUid,
     FirebaseFirestore? firestore,
+    Future<void> Function()? onSessionLockAcquired,
+    Future<void> Function()? onSessionLockReleased,
   })  : _mesh = mesh,
         _db = db,
         _crypto = crypto,
         _syncEngine = syncEngine,
         _currentUserUid = currentUserUid,
-        _firestore = firestore ?? FirebaseFirestore.instance;
+        _firestore = firestore ?? FirebaseFirestore.instance,
+        _onSessionLockAcquired = onSessionLockAcquired,
+        _onSessionLockReleased = onSessionLockReleased;
 
   final MeshService _mesh;
   final AppDatabase _db;
@@ -147,6 +151,14 @@ class AttendanceService {
   final String _currentUserUid;
   final FirebaseFirestore _firestore;
 
+  // ── BLE session lock callbacks ─────────────────────────────────────────────
+  // Injected so AttendanceService has no Riverpod dependency. The provider
+  // wires these to BleStateNotifier.acquireSessionLock/releaseSessionLock.
+  // While a session is active, BLE stays at 500ms/500ms regardless of what
+  // tab the user is on — visiting Profile no longer silences the mesh.
+  final Future<void> Function()? _onSessionLockAcquired;
+  final Future<void> Function()? _onSessionLockReleased;
+
   // ── Active session (teacher side) ──────────────────────────────────────────
   AttendanceSession? _activeSession;
   AttendanceSession? get activeSession => _activeSession;
@@ -154,6 +166,26 @@ class AttendanceService {
   // ── Timers ─────────────────────────────────────────────────────────────────
   Timer? _broadcastTimer;
   Timer? _tokenRefreshTimer;
+
+  // ── Broadcast UUID (Bug 7 fix) ─────────────────────────────────────────────
+  // A fresh UUID is generated ONCE per 89-second token window, not once per
+  // 5-second re-broadcast cycle.
+  //
+  // Previous bug: every call to _broadcastAttendancePacket() called
+  // const Uuid().v4() — creating a brand-new UUID every 5 seconds. Each new
+  // UUID bypasses the SeenPackets deduplication on relay nodes, so every
+  // re-broadcast propagated independently through the full TTL=5 relay chain.
+  // Over a 1-hour class: 720 × 2^5 = ~23 000 relay events.
+  //
+  // Fix: UUID changes only when the HMAC token changes (every 89 seconds).
+  // Within a token window, relay nodes see the same UUID after the first hop
+  // and correctly deduplicate re-broadcasts — cutting relay chains from 720/hr
+  // to ~40/hr (~18× reduction). Coverage is preserved because:
+  //   a) The teacher's direct GATT broadcast to known peers always fires (no UUID needed).
+  //   b) The first broadcast of each window propagates fully through the relay chain.
+  //   c) Students who arrive mid-window are within direct GATT range of the teacher
+  //      (classroom scale ≤ 15 m) and receive the packet on the next 5-second cycle.
+  String? _currentBroadcastId;
 
   // ── Student-side RSSI cache ────────────────────────────────────────────────
   // Tracks the best (least-negative = physically closest) RSSI seen from any
@@ -179,6 +211,23 @@ class AttendanceService {
 
   // ── Student-side already-submitted sessions ────────────────────────────────
   final Set<String> _submittedSessionIds = {};
+
+  // In-progress guard — prevents duplicate concurrent proof assembly.
+  //
+  // BUG FIXED: Previously _submittedSessionIds.add(sessionId) was called
+  // INSIDE _assembleAndSubmitProof, AFTER the async DB write. If two attendance
+  // packets for the same session arrived before the first write completed (e.g.
+  // teacher's 5-second re-broadcast AND a relayed copy arriving simultaneously),
+  // both passed the _submittedSessionIds check, and both launched concurrent
+  // _assembleAndSubmitProof calls. Each generated a new UUID for proofId, so
+  // Drift's insertOnConflictUpdate inserted two separate rows — the teacher saw
+  // the same student twice on the dashboard.
+  //
+  // Fix: add sessionId to _inProgressSessionIds synchronously BEFORE the async
+  // call. If proof assembly fails, remove it so the next packet can retry.
+  // _submittedSessionIds is set only on SUCCESS to permanently prevent
+  // re-submission after a successful proof (even across retries).
+  final Set<String> _inProgressSessionIds = {};
 
   // ── Teacher-side ACK deduplication (Fix 4A) ────────────────────────────────
   // Tracks "sessionId:studentUid" pairs already written to local Drift DB via
@@ -229,7 +278,7 @@ class AttendanceService {
       _onAttendanceAckPacket(packet);
     });
 
-    _statusController.add(const AttendanceStatus.idle());
+    _safeEmit(const AttendanceStatus.idle());
   }
 
   // ── Teacher API ────────────────────────────────────────────────────────────
@@ -285,6 +334,12 @@ class AttendanceService {
     // See VEXT_PROJECT_REPORT.md §8 for full scope and risk analysis.
     _writeSessionToFirestore(_activeSession!).ignore();
 
+    // Acquire session lock — keeps BLE at 500ms/500ms for the entire session
+    // duration, regardless of which tab the teacher or student is viewing.
+    // Must be called BEFORE broadcast so the scan rate is already active
+    // when the first attendance packet is sent.
+    await _onSessionLockAcquired?.call();
+
     // Broadcast immediately, then on a timer.
     await _broadcastAttendancePacket();
 
@@ -293,9 +348,15 @@ class AttendanceService {
       (_) => _broadcastAttendancePacket(),
     );
 
+    // Generate the first broadcast UUID for this token window.
+    // Assigned once here; rotated on each token refresh below.
+    _currentBroadcastId = const Uuid().v4();
+
     // Refresh HMAC every 89 seconds (1 second before the 90-second window rolls).
-    // This ensures the token is always fresh and students never receive an
-    // immediately-expired token.
+    // Also rotates _currentBroadcastId so the new token window uses a fresh UUID.
+    // Relay nodes that have already seen the old UUID in their SeenPackets table
+    // will now propagate the new UUID again — ensuring late-arriving students
+    // whose relay nodes cached the old UUID still receive the updated packet.
     _tokenRefreshTimer = Timer.periodic(
       const Duration(seconds: 89),
       (_) async {
@@ -304,6 +365,8 @@ class AttendanceService {
           _activeSession!.id,
           _activeSession!.courseId,
         );
+        // New token window → new UUID so relay nodes re-propagate.
+        _currentBroadcastId = const Uuid().v4();
       },
     );
 
@@ -318,16 +381,27 @@ class AttendanceService {
     _tokenRefreshTimer?.cancel();
     _tokenRefreshTimer = null;
 
-    if (_activeSession != null) {
+    // Track whether a session was actually active so we only release the BLE
+    // lock that was actually acquired. Students never call startSession(), so
+    // they never acquire a session lock — releasing one they don't hold would
+    // decrement _sessionLockCount below its correct value (guarded by max(0,…)
+    // but semantically wrong and could mask real lock accounting errors).
+    final hadActiveSession = _activeSession != null;
+
+    if (hadActiveSession) {
       _activeSession!.isActive = false;
-      // Fire-and-forget: marking a session inactive has no security implications.
-      // No waitForPendingWrites needed — no Firestore rule reads this value.
       _writeSessionToFirestore(_activeSession!).ignore();
     }
 
     _activeSession = null;
-    // Clear teacher-side ACK dedup cache when session ends.
+    _currentBroadcastId = null;
     _localAckedStudents.clear();
+
+    // Only release the BLE session lock if we actually acquired one.
+    // Matches the acquireSessionLock() call in startSession().
+    if (hadActiveSession) {
+      await _onSessionLockReleased?.call();
+    }
   }
 
   /// Live stream of attendance proofs for [sessionId] from the LOCAL Drift DB.
@@ -379,6 +453,22 @@ class AttendanceService {
     return _crypto.verifyHmacToken(sessionId, courseId, tokenHex);
   }
 
+  // ── Safe emit helper ───────────────────────────────────────────────────────
+
+  /// Emit a status event only if the controller is still open.
+  ///
+  /// Needed because _assembleAndSubmitProof is launched as fire-and-forget
+  /// (`.ignore()`). If dispose() closes _statusController while an async proof
+  /// assembly is still in flight, the late `.add()` call throws
+  /// "Bad state: Cannot add to a closed stream". Since the call site uses
+  /// `.ignore()`, the exception is swallowed — but it still allocates a
+  /// Future and pollutes debug output. This guard eliminates the throw entirely.
+  void _safeEmit(AttendanceStatus status) {
+    if (!_statusController.isClosed) {
+      _statusController.add(status);
+    }
+  }
+
   // ── Dispose ────────────────────────────────────────────────────────────────
 
   Future<void> dispose() async {
@@ -390,6 +480,7 @@ class AttendanceService {
     _bestAdvertisementRssi = null;
     _bestAdvertisementRssiTime = null;
     _submittedSessionIds.clear();
+    _inProgressSessionIds.clear();
     _localAckedStudents.clear();
   }
 
@@ -399,8 +490,14 @@ class AttendanceService {
     final session = _activeSession;
     if (session == null || !session.isActive) return;
 
+    // Reuse the token-window UUID instead of generating a new one every 5s.
+    // _currentBroadcastId is initialised in startSession() and rotated only
+    // when the HMAC token refreshes (every 89 s). Within a window, relay nodes
+    // correctly deduplicate re-broadcasts using the SeenPackets table.
+    final broadcastId = _currentBroadcastId ??= const Uuid().v4();
+
     final packet = MeshPacket.attendance(
-      id: const Uuid().v4(),
+      id: broadcastId,
       senderUid: _currentUserUid,
       sessionId: session.id,
       hmacToken: session.currentHmacToken,
@@ -420,7 +517,6 @@ class AttendanceService {
   // ── Private — incoming packet handler (student side) ──────────────────────
 
   void _onAttendancePacket(MeshPacket packet) {
-    // Ignore our own packets (teacher broadcasting) to avoid self-marking.
     if (packet.senderUid == _currentUserUid) return;
 
     final decoded = packet.decodeAttendancePayload();
@@ -429,10 +525,17 @@ class AttendanceService {
     final sessionId = decoded.sessionId;
     final hmacToken = decoded.hmacToken;
 
-    // Don't submit a second proof for the same session.
+    // Guard 1: already submitted successfully — permanent block.
     if (_submittedSessionIds.contains(sessionId)) return;
 
-    _statusController.add(AttendanceStatus(
+    // Guard 2: proof assembly already in-flight — block concurrent duplicates.
+    // This is the race condition fix: checked and set SYNCHRONOUSLY before
+    // launching the async operation, so two packets arriving at the same time
+    // both hit this check and only one proceeds.
+    if (_inProgressSessionIds.contains(sessionId)) return;
+    _inProgressSessionIds.add(sessionId);
+
+    _safeEmit(AttendanceStatus(
       type: AttendanceStatusType.detecting,
       sessionId: sessionId,
     ));
@@ -440,8 +543,8 @@ class AttendanceService {
     _assembleAndSubmitProof(
       sessionId: sessionId,
       hmacToken: hmacToken,
-      gattRssi: 0, // GATT path — real RSSI not available post-connection
-    );
+      gattRssi: 0,
+    ).ignore();
   }
 
   void _onAttendanceAdvertisement(AttendanceAdvertisement adv) {
@@ -473,9 +576,12 @@ class AttendanceService {
     required String hmacToken,
     required int gattRssi,
   }) async {
-    // Upgrade RSSI with the best advertisement-path reading if it was captured
-    // within the last 30 seconds. Clear the cache after consuming it so a
-    // single advertisement reading is never applied to two different proofs.
+    // Read the best advertisement RSSI captured in the last 30 seconds.
+    // Do NOT clear the cache yet — clearing before the gate check is the bug:
+    // if the gate rejects (RSSI too weak), the cache is gone and the next
+    // GATT packet has no advertisement RSSI to check. It falls back to
+    // gattRssi=0, which unconditionally bypasses the gate, allowing students
+    // outside the classroom to mark attendance.
     int? advertisementRssi;
     final rssiCheckTime = DateTime.now();
     if (_bestAdvertisementRssi != null &&
@@ -484,27 +590,35 @@ class AttendanceService {
             const Duration(seconds: 30)) {
       advertisementRssi = _bestAdvertisementRssi;
     }
-    // Clear cache regardless — prevents stale data from leaking into the next proof.
-    _bestAdvertisementRssi = null;
-    _bestAdvertisementRssiTime = null;
 
     final effectiveRssi = advertisementRssi ?? gattRssi;
 
-    // Check minimum RSSI gate. GATT rssi=0 bypasses the gate (we trust
-    // GATT connection proximity — a connection at all requires < 15 m).
-    // Advertisement RSSI uses rssiThresholdAttendance (-85 dBm) which is
-    // intentionally softer than the mesh relay threshold (-75 dBm) to avoid
-    // false-rejections caused by body shielding or device orientation.
+    // Check minimum RSSI gate BEFORE clearing the cache.
+    // GATT rssi=0 bypasses the gate — a GATT connection succeeding at all
+    // is sufficient proximity evidence (requires < 15 m typically).
+    // Advertisement RSSI uses rssiThresholdAttendance (-85 dBm), intentionally
+    // softer than the mesh relay threshold (-75 dBm) to tolerate body shielding.
     if (effectiveRssi != 0 &&
         effectiveRssi < AppConstants.rssiThresholdAttendance) {
-      // Too far away — do not mark present.
-      _statusController.add(AttendanceStatus(
+      // Rejected — do NOT clear the cache. The same reading may still be valid
+      // for the next GATT packet that arrives within the 30-second window.
+      // The cache naturally expires via the staleness check in
+      // _onAttendanceAdvertisement once 30 seconds have elapsed.
+      _safeEmit(AttendanceStatus(
         type: AttendanceStatusType.error,
         sessionId: sessionId,
         error: 'Signal too weak (${effectiveRssi} dBm). Move closer.',
       ));
       return;
     }
+
+    // Gate passed — now consume and clear the advertisement RSSI cache.
+    // Safe to clear here: the proof is about to be assembled using this reading.
+    // Clearing prevents the same advertisement RSSI from being applied to a
+    // second proof if _assembleAndSubmitProof were somehow called again for
+    // a different session (defensive hygiene).
+    _bestAdvertisementRssi = null;
+    _bestAdvertisementRssiTime = null;
 
     final proofId = const Uuid().v4();
     final now = DateTime.now();
@@ -523,6 +637,8 @@ class AttendanceService {
 
     try {
       await _db.upsertAttendanceProof(proof);
+      // Mark as permanently submitted ONLY on success.
+      // _inProgressSessionIds is cleared in the finally block below.
       _submittedSessionIds.add(sessionId);
 
       // Send an ACK packet back to the mesh (Fix 4A).
@@ -544,18 +660,25 @@ class AttendanceService {
       // Trigger immediate sync so proof appears in teacher's Firebase dashboard.
       _syncEngine.syncNow().ignore();
 
-      _statusController.add(AttendanceStatus(
+      _safeEmit(AttendanceStatus(
         type: AttendanceStatusType.markedPresent,
         sessionId: sessionId,
         proofId: proofId,
         rssi: effectiveRssi,
       ));
     } catch (e) {
-      _statusController.add(AttendanceStatus(
+      _safeEmit(AttendanceStatus(
         type: AttendanceStatusType.error,
         sessionId: sessionId,
         error: 'Failed to save proof: $e',
       ));
+    } finally {
+      // Always release the in-progress lock.
+      // On SUCCESS: _submittedSessionIds.add was already called, so the next
+      //   packet hits Guard 1 and is blocked permanently — correct.
+      // On FAILURE: _submittedSessionIds was NOT added, so the next packet
+      //   can retry proof assembly — correct (transient DB/network failure).
+      _inProgressSessionIds.remove(sessionId);
     }
   }
 

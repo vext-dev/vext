@@ -30,15 +30,15 @@ import '../../../core/app_theme.dart';
 import '../../../providers/providers.dart';
 import '../../../services/drift_service.dart';
 
-// Convenience local color aliases (mirrors SOS screen pattern)
-const _kSurface = Color(0xFF0F1923);
-const _kCard = Color(0xFF1A2535);
-const _kTextPrimary = Color(0xFFE2E8F0);
-const _kTextSecondary = Color(0xFF8BA3C0);
-const _kHint = Color(0xFF4D6480);
-const _kBubbleOut = Color(0xFF1E3A5F); // outgoing: dark blue
-const _kBubbleIn = Color(0xFF1A2535);  // incoming: card surface
-const _kBorder = Color(0xFF1A3352);
+// Convenience local color aliases — keep in sync with AppTheme
+const _kSurface = Color(0xFF060E1A); // AppTheme.backgroundColor
+const _kCard = Color(0xFF0F1D30); // AppTheme.cardColor
+const _kTextPrimary = Color(0xFFEDF4FF); // AppTheme.primaryTextColor
+const _kTextSecondary = Color(0xFF7EA8C8); // AppTheme.secondaryTextColor
+const _kHint = Color(0xFF3C6080); // AppTheme.hintTextColor
+const _kBubbleOut = Color(0xFF0A2840); // outgoing: deep cyan-tinted dark
+const _kBubbleIn = Color(0xFF0F1D30); // incoming: card surface
+const _kBorder = Color(0xFF0D2646); // AppTheme.inputBorderColor
 
 // ── SocialScreen ───────────────────────────────────────────────────────────────
 

@@ -76,6 +76,12 @@ dev_dependencies:
 
   # ── Testing ───────────────────────────────────────────────────────────────────
   mockito: ^5.4.4
+  # In-memory fake for cloud_firestore — lets AttendanceService's injected
+  # FirebaseFirestore run against real collection/doc/set/snapshots() calls
+  # in unit tests without Firebase.initializeApp() or a real backend.
+  # Pinned to the 3.x line: it requires cloud_firestore ^5.0.0, matching the
+  # ^5.4.4 pinned above (the 4.x line requires cloud_firestore ^6.x).
+  fake_cloud_firestore: ^3.1.0
 
 flutter:
   uses-material-design: true

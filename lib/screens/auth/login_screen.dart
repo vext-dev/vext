@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -143,16 +145,43 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
       onTap: () => FocusScope.of(context).unfocus(),
       child: Scaffold(
         backgroundColor: AppTheme.backgroundColor,
-        body: SafeArea(
-          child: Center(
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 40),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  // ── Logo ────────────────────────────────────────────────
-                  _VextLogo(),
-                  const SizedBox(height: 48),
+        body: Stack(
+          children: [
+            // ── Mesh background ────────────────────────────────────────────
+            Positioned.fill(
+              child: CustomPaint(painter: _MeshBackgroundPainter()),
+            ),
+            // ── Top vignette to help text readability ──────────────────────
+            Positioned(
+              top: 0,
+              left: 0,
+              right: 0,
+              height: 280,
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [
+                      AppTheme.backgroundColor,
+                      AppTheme.backgroundColor.withValues(alpha: 0),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            // ── Form content ───────────────────────────────────────────────
+            SafeArea(
+              child: Center(
+                child: SingleChildScrollView(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 28, vertical: 40),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      // ── Logo ──────────────────────────────────────────────
+                      const _VextLogo(),
+                      const SizedBox(height: 48),
 
                   // ── Headline ────────────────────────────────────────────
                   Text(
@@ -238,8 +267,9 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
                               backgroundColor: AppTheme.primaryColor,
                               foregroundColor: AppTheme.onPrimaryColor,
                               disabledBackgroundColor:
-                                  AppTheme.primaryColor.withValues(alpha: 0.6),
+                                  AppTheme.primaryColor.withValues(alpha: 0.5),
                               elevation: 0,
+                              shadowColor: Colors.transparent,
                               shape: RoundedRectangleBorder(
                                 borderRadius: BorderRadius.circular(12),
                               ),
@@ -257,8 +287,8 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
                                     'Login',
                                     style: TextStyle(
                                       fontSize: 16,
-                                      fontWeight: FontWeight.w600,
-                                      letterSpacing: 0.3,
+                                      fontWeight: FontWeight.w700,
+                                      letterSpacing: 0.5,
                                     ),
                                   ),
                           ),
@@ -281,8 +311,7 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
                         ),
                       ),
                       TextButton(
-                        onPressed: () =>
-                            context.push(AppRoutes.signup),
+                        onPressed: () => context.push(AppRoutes.signup),
                         style: TextButton.styleFrom(
                           foregroundColor: AppTheme.primaryColor,
                           padding: const EdgeInsets.symmetric(horizontal: 6),
@@ -299,13 +328,15 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
                       ),
                     ],
                   ),
-                ],
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
+                    ],                  // Column.children
+                  ),                    // Column
+                ),                      // SingleChildScrollView
+              ),                        // Center
+            ),                          // SafeArea
+          ],                            // Stack.children
+        ),                              // Stack
+      ),                                // Scaffold
+    );                                  // GestureDetector / return
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
@@ -351,21 +382,79 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
 
 // ── Sub-widgets ───────────────────────────────────────────────────────────────
 
-/// VEXT logo rendered as styled text — swap for an Image asset if needed.
+/// VEXT brand logo — icon + glowing wordmark + tagline.
 class _VextLogo extends StatelessWidget {
   const _VextLogo();
 
   @override
   Widget build(BuildContext context) {
-    return Text(
-      'VEXT',
-      textAlign: TextAlign.center,
-      style: TextStyle(
-        color: AppTheme.primaryColor,
-        fontSize: 36,
-        fontWeight: FontWeight.w800,
-        letterSpacing: 6,
-      ),
+    return Column(
+      children: [
+        // ── Hub icon with glow ring ──────────────────────────────────────
+        Container(
+          width: 72,
+          height: 72,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: AppTheme.cardColor,
+            border: Border.all(
+              color: AppTheme.primaryColor.withValues(alpha: 0.35),
+              width: 1.5,
+            ),
+            boxShadow: AppTheme.primaryGlow(intensity: 0.8),
+          ),
+          child: const Icon(
+            Icons.hub_outlined,
+            color: AppTheme.accentColor,
+            size: 34,
+          ),
+        ),
+
+        const SizedBox(height: 20),
+
+        // ── VEXT wordmark — glowing signal cyan ──────────────────────────
+        const Text(
+          'VEXT',
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            color: AppTheme.accentColor, // #22D3EE — lighter signal cyan
+            fontSize: 40,
+            fontWeight: FontWeight.w900,
+            letterSpacing: 10,
+            shadows: AppTheme.primaryTextGlow, // cyan glow
+          ),
+        ),
+
+        const SizedBox(height: 10),
+
+        // ── Tagline ──────────────────────────────────────────────────────
+        Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Container(
+              width: 24,
+              height: 1,
+              color: AppTheme.inputBorderColor,
+            ),
+            const SizedBox(width: 10),
+            const Text(
+              'CAMPUS MESH INTELLIGENCE',
+              style: TextStyle(
+                color: AppTheme.hintTextColor,
+                fontSize: 9.5,
+                letterSpacing: 2.8,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(width: 10),
+            Container(
+              width: 24,
+              height: 1,
+              color: AppTheme.inputBorderColor,
+            ),
+          ],
+        ),
+      ],
     );
   }
 }
@@ -379,7 +468,7 @@ class _InputLabel extends StatelessWidget {
   Widget build(BuildContext context) {
     return Text(
       label,
-      style: TextStyle(
+      style: const TextStyle(
         color: AppTheme.primaryTextColor,
         fontSize: 13,
         fontWeight: FontWeight.w500,
@@ -387,4 +476,82 @@ class _InputLabel extends StatelessWidget {
       ),
     );
   }
+}
+
+// ── Mesh background ────────────────────────────────────────────────────────────
+
+/// Paints a subtle hexagonal-style mesh node grid — evokes BLE mesh topology.
+/// All colours are very low opacity so they don't compete with the form UI.
+class _MeshBackgroundPainter extends CustomPainter {
+  const _MeshBackgroundPainter();
+
+  // Spacing between nodes in logical pixels.
+  static const double _hSpacing = 52.0;
+  static const double _vSpacing = 44.0;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final linePaint = Paint()
+      ..color = const Color(0xFF06B6D4).withValues(alpha: 0.14)
+      ..strokeWidth = 0.7
+      ..style = PaintingStyle.stroke;
+
+    final diagPaint = Paint()
+      ..color = const Color(0xFF06B6D4).withValues(alpha: 0.07)
+      ..strokeWidth = 0.6
+      ..style = PaintingStyle.stroke;
+
+    final dotPaint = Paint()
+      ..color = const Color(0xFF06B6D4).withValues(alpha: 0.20)
+      ..style = PaintingStyle.fill;
+
+    final activeDotPaint = Paint()
+      ..color = const Color(0xFF22D3EE).withValues(alpha: 0.42)
+      ..style = PaintingStyle.fill;
+
+    final cols = (size.width / _hSpacing).ceil() + 2;
+    final rows = (size.height / _vSpacing).ceil() + 2;
+
+    // Predefined "active" node positions for visual interest
+    const activeSet = {3, 11, 19, 27, 35, 42};
+
+    for (int r = 0; r < rows; r++) {
+      for (int c = 0; c < cols; c++) {
+        // Stagger odd rows by half a column width (honeycomb feel)
+        final xOffset = r.isOdd ? _hSpacing * 0.5 : 0.0;
+        final x = c * _hSpacing + xOffset - _hSpacing;
+        final y = r * _vSpacing - _vSpacing;
+
+        final nodeIndex = r * cols + c;
+        final isActive = activeSet.contains(nodeIndex % 50);
+
+        // Horizontal connection → right neighbour
+        if (c < cols - 1) {
+          final nx = (c + 1) * _hSpacing + xOffset - _hSpacing;
+          canvas.drawLine(Offset(x, y), Offset(nx, y), linePaint);
+        }
+
+        // Diagonal connection ↘ (alternating cells to avoid over-crowding)
+        if (r < rows - 1 && c < cols - 1 && (r + c).isEven) {
+          final nextOffset = r.isOdd ? 0.0 : _hSpacing * 0.5;
+          canvas.drawLine(
+            Offset(x, y),
+            Offset((c + 1) * _hSpacing + nextOffset - _hSpacing,
+                (r + 1) * _vSpacing - _vSpacing),
+            diagPaint,
+          );
+        }
+
+        // Node dot
+        canvas.drawCircle(
+          Offset(x, y),
+          isActive ? 3.0 : 1.8,
+          isActive ? activeDotPaint : dotPaint,
+        );
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(_MeshBackgroundPainter _) => false;
 }

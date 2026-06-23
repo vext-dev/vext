@@ -32,6 +32,8 @@
 import 'dart:async';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart';
+
 import '../core/app_constants.dart';
 import '../core/proto/mesh_packet.dart';
 import '../services/ble_transport_layer.dart';
@@ -111,6 +113,19 @@ class MeshService {
   Stream<AttendanceAdvertisement> get attendanceAdvertisements =>
       _attendanceAdvController.stream;
 
+  // ── External callbacks ─────────────────────────────────────────────────────
+
+  /// Called when an SOS packet is received and dispatched (relay nodes only).
+  ///
+  /// Wire this in mesh_service_provider.dart to BleStateNotifier.acquireSosLock
+  /// with a 60-second auto-release timer. This ensures relay nodes boost their
+  /// own BLE scan to 100ms/100ms immediately upon receiving an SOS, so they
+  /// can discover and relay to their own neighbours faster.
+  ///
+  /// Without this, relay nodes stay in whatever duty cycle they were in (often
+  /// idle = 30s sleep), making multi-hop SOS delivery take 30+ seconds per hop.
+  VoidCallback? onSosPacketReceived;
+
   // ── Internal state ─────────────────────────────────────────────────────────
 
   bool _initialized = false;
@@ -140,7 +155,9 @@ class MeshService {
   }
 
   /// Stop all mesh activity and close stream controllers.
+  /// Safe to call multiple times — guarded by _initialized flag.
   void dispose() {
+    if (!_initialized) return; // already disposed — guard against double-call
     _transport.onPacketReceived = null;
     _maintenanceTimer?.cancel();
     _attendanceController.close();
@@ -160,11 +177,31 @@ class MeshService {
   /// is capped at the moment of broadcast, the packet is queued and retried
   /// every 3 seconds for up to 30 seconds (Fix 2C). Other types rely on their
   /// own re-broadcast timers (attendance: 5 s, social: no retry needed).
+  ///
+  /// SOS and attendance packets use `requireAck: true` — ATT Write Request
+  /// waits for the peer's BLE controller to confirm receipt, making
+  /// `sendPacketToPeer` returning `true` mean "peer received it" not just
+  /// "local radio queued it". This is the correct semantic for originated
+  /// packets where the retry and re-broadcast logic depends on delivery proof.
+  /// Relay hops (in _scheduleRelay) do NOT set requireAck so relay throughput
+  /// is not degraded by round-trip confirmation overhead.
   Future<void> sendPacket(MeshPacket packet) async {
     await _db.markPacketSeen(packet.id);
+    final isCritical = packet.type == PacketType.sos ||
+        packet.type == PacketType.attendance ||
+        packet.type == PacketType.ack;
+
+    // retryOnAllFailure: true for SOS (safety-critical) AND messages (slow
+    // without retry — if _peerDevices is empty on send, the message is silently
+    // dropped with no fallback on BLE-only setups).
+    // Attendance and ACK re-broadcast is handled by their own timers.
+    final needsRetry = packet.type == PacketType.sos ||
+        packet.type == PacketType.message;
+
     _transport.broadcastPacket(
       packet.toBytes(),
-      retryOnAllFailure: packet.type == PacketType.sos,
+      retryOnAllFailure: needsRetry,
+      requireAck: isCritical,
     );
   }
 
@@ -208,6 +245,12 @@ class MeshService {
 
       case PacketType.sos:
         _sosController.add(packet);
+        // Notify the BLE layer so relay nodes boost their own scan rate.
+        // This is essential for multi-hop SOS delivery: without this, Phone B
+        // receives the SOS from Phone A but can't relay to Phone C because B
+        // is in idle mode (30s sleep gap). The boost ensures B scans at 100ms
+        // immediately after receiving, so C is discovered within one cycle.
+        onSosPacketReceived?.call();
 
       case PacketType.ack:
         _ackController.add(packet);

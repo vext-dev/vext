@@ -222,6 +222,20 @@ class SosService {
     _activeSosPacket = packet;
     _markProcessed(sosId); // don't echo our own SOS back to UI
 
+    // ── Boost BLE BEFORE sending ────────────────────────────────────────────
+    // Critical ordering fix: acquireSosLock() switches BLE to 100ms/100ms
+    // duty cycle and triggers _restartDutyCycle() BEFORE sendPacket() runs.
+    // This ensures the BLE scan window is active when broadcastPacket() fires,
+    // maximising the chance that _peerDevices is populated on the FIRST attempt.
+    //
+    // Previous bug: onSosActivated was called AFTER sendPacket(), meaning the
+    // first broadcast almost always found _peerDevices empty (idle mode =
+    // 30-second sleep gap) and fell into the retry queue. With the boost first,
+    // the 100ms scan fires, discovers nearby peers, and the packet is delivered
+    // within the first cycle (~100-200ms) rather than waiting 3 seconds for
+    // the retry queue to fire.
+    await _onSosActivated?.call();
+
     // ── Send immediately ────────────────────────────────────────────────────
     await _mesh.sendPacket(packet);
 
@@ -239,10 +253,7 @@ class SosService {
     // ── Sync to Firestore — triggers handleSOSAlert Cloud Function ──────────
     _syncEngine.syncNow().ignore();
 
-    // ── Boost BLE to SOS duty cycle (100ms/100ms) ───────────────────────────
-    // Critical: mesh relay speed is 5x faster in SOS mode. Called via injected
-    // callback so SosService has no dependency on Riverpod or BleStateNotifier.
-    _onSosActivated?.call().ignore();
+    // BLE boost already applied above (before sendPacket). No-op here.
 
     // ── Re-assert foreground service priority (Fix 5A) ───────────────────────
     // On Samsung One UI and Xiaomi MIUI, the OS may silently demote the

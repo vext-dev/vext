@@ -66,7 +66,24 @@ class SocialService {
   final FirebaseFirestore _firestore;
 
   // ── Dedup ──────────────────────────────────────────────────────────────────
+  //
+  // Caps at _dedupeMaxSize entries with FIFO eviction — mirrors SosService.
+  //
+  // WHY A CAP: SocialService is alive for the entire authenticated session
+  // (only disposed on logout). Over a full campus day with hundreds of
+  // messages, an uncapped Set grows indefinitely. Each UUID is ~36 bytes;
+  // 10 000 entries ≈ 360 KB plus Set overhead. The cap bounds memory to
+  // ~18 KB (500 × 36 B) regardless of session length.
+  //
+  // WHY FIFO: oldest IDs are the least likely to be re-delivered — BLE mesh
+  // dedup windows are short (60-minute SeenPackets TTL in Drift). Evicting
+  // the oldest entry is therefore the correct policy: a re-delivered ancient
+  // packet would be dropped by the DB's insertOnConflictUpdate anyway (same
+  // primary key), so the Set-level dedup missing it causes at most a harmless
+  // no-op DB write, not a duplicate in the UI.
+  static const _dedupeMaxSize = 500;
   final Set<String> _processedPacketIds = {};
+  final List<String> _processedPacketOrder = []; // insertion-order for eviction
 
   // ── Subscriptions ──────────────────────────────────────────────────────────
   StreamSubscription<MeshPacket>? _packetSub;
@@ -137,7 +154,7 @@ class SocialService {
     );
 
     // Mark as processed so we don't echo our own send back to the chat.
-    _processedPacketIds.add(msgId);
+    _markProcessed(msgId);
 
     // ── Send over mesh ───────────────────────────────────────────────────────
     await _mesh.sendPacket(packet);
@@ -164,6 +181,24 @@ class SocialService {
     await _packetSub?.cancel();
     await _firestoreSub?.cancel();
     _processedPacketIds.clear();
+    _processedPacketOrder.clear();
+  }
+
+  // ── Private — dedup helper ─────────────────────────────────────────────────
+
+  /// Mark [id] as processed. Evicts the oldest entry when the cap is reached
+  /// (FIFO via [_processedPacketOrder]) so memory stays bounded across long
+  /// sessions. Returns true if the id was NOT previously seen (caller should
+  /// process it); false if it was already seen (caller should skip it).
+  bool _markProcessed(String id) {
+    if (_processedPacketIds.contains(id)) return false;
+    if (_processedPacketIds.length >= _dedupeMaxSize) {
+      final oldest = _processedPacketOrder.removeAt(0);
+      _processedPacketIds.remove(oldest);
+    }
+    _processedPacketIds.add(id);
+    _processedPacketOrder.add(id);
+    return true;
   }
 
   // ── Private ────────────────────────────────────────────────────────────────
@@ -174,8 +209,7 @@ class SocialService {
     if (packet.senderUid == _currentUserUid) return;
 
     // Deduplicate — mesh relay can deliver the same packet multiple times.
-    if (_processedPacketIds.contains(packet.id)) return;
-    _processedPacketIds.add(packet.id);
+    if (!_markProcessed(packet.id)) return;
 
     final content = packet.decodeMessageContent();
     if (content == null || content.isEmpty) return;
@@ -219,8 +253,7 @@ class SocialService {
           ttl == null || tsRaw == null) continue;
 
       // Deduplicate — might have already arrived via BLE mesh.
-      if (_processedPacketIds.contains(id)) continue;
-      _processedPacketIds.add(id);
+      if (!_markProcessed(id)) continue;
 
       // Ignore our own messages echoed back from Firestore.
       if (senderUid == _currentUserUid) continue;

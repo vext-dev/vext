@@ -264,27 +264,6 @@ class _SplashScreen extends StatelessWidget {
   }
 }
 
-// ── Placeholder for lanes not yet implemented ─────────────────────────────────
-
-class _PlaceholderScreen extends StatelessWidget {
-  const _PlaceholderScreen({required this.label});
-  final String label;
-
-  @override
-  Widget build(BuildContext context) {
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          const Icon(Icons.construction, color: Color(0xFF4D7096), size: 48),
-          const SizedBox(height: 16),
-          Text(
-            label,
-            style: const TextStyle(color: Color(0xFF8BA3C0), fontSize: 16),
-            textAlign: TextAlign.center,
-          ),
-        ],
-      ),
-    );
-  }
-}
+// _PlaceholderScreen was removed — all lanes (Attendance, Social, SOS, Profile)
+// are now fully implemented. If a future milestone needs a stub screen, add a
+// new dedicated class here rather than reusing a generic placeholder.
