@@ -13,9 +13,11 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../lanes/social/social_service.dart';
 import 'auth_service_provider.dart';
+import 'crypto_service_provider.dart';
 import 'database_provider.dart';
 import 'firebase_sync_engine_provider.dart';
 import 'mesh_service_provider.dart';
+import 'public_key_directory_service_provider.dart';
 
 final socialServiceProvider = FutureProvider<SocialService>((ref) async {
   // ── UID — registered before any awaits so invalidation is caught correctly
@@ -29,12 +31,16 @@ final socialServiceProvider = FutureProvider<SocialService>((ref) async {
   final mesh       = await ref.watch(meshServiceProvider.future);
   final db         = await ref.watch(databaseProvider.future);
   final syncEngine = await ref.watch(firebaseSyncEngineProvider.future);
+  final crypto     = await ref.watch(cryptoServiceProvider.future);
+  final publicKeyDirectory = ref.watch(publicKeyDirectoryServiceProvider);
 
   final service = SocialService(
     mesh: mesh,
     db: db,
     syncEngine: syncEngine,
     currentUserUid: uid,
+    crypto: crypto,
+    publicKeyDirectory: publicKeyDirectory,
   );
 
   service.initialize();

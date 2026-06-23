@@ -120,10 +120,21 @@ abstract class AppConstants {
   static const String fsRecords = 'records';
   static const String fsSosEvents = 'sos_events';
 
+  /// X25519 public-key directory for Lane B DM encryption (Milestone 7).
+  /// Separate from users/{uid}.public_key, which holds only the 16-hex-char
+  /// fingerprint (display/debug identifier) — NOT the full key bytes ECDH
+  /// requires. See crypto_service.dart's fingerprint doc comment.
+  static const String fsPublicKeys = 'public_keys';
+
   // ── Firebase Cloud Function names ─────────────────────────────────────────
   static const String fnHandleSosAlert = 'handleSOSAlert';
   static const String fnAggregateAttendance = 'aggregateAttendance';
-  static const String fnRotatePeerKeys = 'rotatePeerKeys';
+  // NOTE: no rotatePeerKeys function — decided unnecessary 2026-06-23.
+  // Private keys never leave the device (CryptoService), so a Cloud Function
+  // cannot rotate them; the client already re-uploads its current public key
+  // on every app session (PublicKeyDirectoryService.uploadOwnPublicKey), and
+  // peers always derive the ECDH shared secret fresh per message. See
+  // VEXT_FINAL_CHECKLIST.md for the full reasoning.
 
   // ── User Roles ────────────────────────────────────────────────────────────
   static const String roleStudent = 'student';

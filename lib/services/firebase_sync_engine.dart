@@ -264,9 +264,21 @@ class FirebaseSyncEngine {
     final batch = _firestore.batch();
 
     for (final msg in messages) {
-      // All social messages go to the shared 'broadcast' thread so every
-      // authenticated user's Firestore subscription can read them (BUG C4 fixed).
-      const threadId = 'broadcast';
+      // Broadcast messages (recipientUid == null) go to the shared
+      // 'broadcast' thread so every authenticated user's Firestore
+      // subscription can read them (BUG C4 fixed).
+      //
+      // Direct messages (Milestone 7) go to a per-pair thread named by the
+      // two participants' UIDs sorted lexicographically — this exact scheme
+      // was the ORIGINAL design intent (see firestore.rules' own comment on
+      // the messages/{threadId}/records rule: "threadId is derived from
+      // sorted sender+recipient UIDs in FirebaseSyncEngine"), not a new
+      // convention introduced here. Sorting means either participant computes
+      // the same threadId regardless of who sent the most recent message.
+      final recipientUid = msg.recipientUid;
+      final threadId = recipientUid == null
+          ? 'broadcast'
+          : ([msg.senderUid, recipientUid]..sort()).join('_');
 
       final ref = _firestore
           .collection(AppConstants.fsMessages)
@@ -274,14 +286,24 @@ class FirebaseSyncEngine {
           .collection(AppConstants.fsRecords)
           .doc(msg.id);
 
+      // For DMs, 'contentEncrypted' in Firestore holds the base64 CIPHERTEXT
+      // blob (msg.cipherBlob), never plaintext — confidentiality is preserved
+      // end-to-end even though the local DB field of the same name holds
+      // plaintext (see MessageRecords.contentEncrypted's doc comment).
+      // Broadcast messages are unencrypted by design, so their
+      // contentEncrypted is plaintext in both places, unchanged from before.
+      final contentForFirestore =
+          recipientUid == null ? msg.contentEncrypted : (msg.cipherBlob ?? '');
+
       batch.set(ref, {
         'id':               msg.id,
         'senderUid':        msg.senderUid,
-        'contentEncrypted': msg.contentEncrypted,
+        'contentEncrypted': contentForFirestore,
         'ttl':              msg.ttl,
         'timestamp':        Timestamp.fromDate(msg.timestamp),
         'lane':             msg.lane,
         'syncedAt':         FieldValue.serverTimestamp(),
+        if (recipientUid != null) 'recipientUid': recipientUid,
       }, SetOptions(merge: true));
     }
 

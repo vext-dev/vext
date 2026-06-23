@@ -15,6 +15,7 @@ import '../lanes/attendance/screens/teacher_session_screen.dart';
 import '../lanes/attendance/screens/student_attendance_screen.dart';
 import '../lanes/sos/screens/sos_screen.dart';    // M5 — Lane C
 import '../lanes/social/screens/social_screen.dart'; // M6 — Lane B
+import '../lanes/social/screens/direct_message_screen.dart'; // M7 — Lane B 1:1 DM
 
 // ── Route path constants ──────────────────────────────────────────────────────
 
@@ -32,6 +33,9 @@ abstract class AppRoutes {
   static const String studentAttendance = '/home/attendance/student';
   // M5 / M6 sub-routes (placeholder — will be filled in those milestones)
   static const String social = '/home/social';
+  // M7 sub-route — Lane B 1:1 encrypted DM. Relative segment is 'dm/:peerUid';
+  // navigate with context.push('$social/dm/$peerUid', extra: peerName).
+  static const String socialDirectMessage = '/home/social/dm';
   static const String sos = '/home/sos';
   static const String profile = '/home/profile';
   // NOTE(logout): Logout is available from:
@@ -198,6 +202,21 @@ final routerProvider = Provider<GoRouter>((ref) {
           GoRoute(
             path: AppRoutes.social,
             builder: (context, state) => const SocialScreen(), // M6 — Lane B
+            routes: [
+              // M7 — Lane B 1:1 encrypted DM (navigate with context.push)
+              GoRoute(
+                path: 'dm/:peerUid',
+                builder: (context, state) {
+                  final peerUid = state.pathParameters['peerUid']!;
+                  final peerName =
+                      state.extra is String ? state.extra as String : null;
+                  return DirectMessageScreen(
+                    peerUid: peerUid,
+                    peerName: peerName,
+                  );
+                },
+              ),
+            ],
           ),
           GoRoute(
             path: AppRoutes.sos,

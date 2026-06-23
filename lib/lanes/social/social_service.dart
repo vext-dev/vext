@@ -34,6 +34,7 @@
 // ──────────────────────────────────────────────────────────────────────────────
 
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:drift/drift.dart' show Value;
@@ -42,9 +43,11 @@ import 'package:uuid/uuid.dart';
 
 import '../../core/app_constants.dart';
 import '../../core/proto/mesh_packet.dart';
+import '../../services/crypto_service.dart';
 import '../../services/drift_service.dart';
 import '../../services/firebase_sync_engine.dart';
 import '../../services/mesh_service.dart';
+import '../../services/public_key_directory_service.dart';
 
 class SocialService {
   SocialService({
@@ -52,17 +55,23 @@ class SocialService {
     required AppDatabase db,
     required FirebaseSyncEngine syncEngine,
     required String currentUserUid,
+    required CryptoService crypto,
+    required PublicKeyDirectoryService publicKeyDirectory,
     FirebaseFirestore? firestore,
   })  : _mesh = mesh,
         _db = db,
         _syncEngine = syncEngine,
         _currentUserUid = currentUserUid,
+        _crypto = crypto,
+        _publicKeyDirectory = publicKeyDirectory,
         _firestore = firestore ?? FirebaseFirestore.instance;
 
   final MeshService _mesh;
   final AppDatabase _db;
   final FirebaseSyncEngine _syncEngine;
   final String _currentUserUid;
+  final CryptoService _crypto;
+  final PublicKeyDirectoryService _publicKeyDirectory;
   final FirebaseFirestore _firestore;
 
   // ── Dedup ──────────────────────────────────────────────────────────────────
@@ -93,14 +102,27 @@ class SocialService {
   // FirebaseSyncEngine._syncMessages() writes to (threadId = 'broadcast').
   StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _firestoreSub;
 
+  // Mesh stream of 1:1 direct messages (Milestone 7).
+  StreamSubscription<MeshPacket>? _directMessageSub;
+
+  // Firestore collectionGroup listener for DMs addressed to this device that
+  // arrived via a path with no BLE link (e.g. another building, WiFi-only).
+  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _firestoreDmSub;
+
   // ── Public: live message list ──────────────────────────────────────────────
 
-  /// Live stream of all [MessageRecord] rows, ordered newest-first.
+  /// Live stream of all BROADCAST [MessageRecord] rows, ordered newest-first.
   ///
   /// Backed by Drift's [watch] — emits immediately on every insert.
   /// SocialScreen consumes this stream to render the chat list without any
-  /// additional polling or manual refresh.
+  /// additional polling or manual refresh. Direct messages are excluded —
+  /// see [directMessageStream] for 1:1 threads.
   Stream<List<MessageRecord>> get messageStream => _db.watchAllMessages();
+
+  /// Live stream of a single 1:1 DM thread with [peerUid], ordered
+  /// newest-first. Used by DirectMessageScreen.
+  Stream<List<MessageRecord>> directMessageStream(String peerUid) =>
+      _db.watchDirectMessages(_currentUserUid, peerUid);
 
   // ── Initialise ─────────────────────────────────────────────────────────────
 
@@ -128,6 +150,42 @@ class SocialService {
         .snapshots()
         .listen(_onFirestoreSnapshot, onError: (e) {
       debugPrint('[Social] Firestore snapshot error: $e');
+    });
+
+    // ── Direct messages (Milestone 7) ─────────────────────────────────────────
+
+    // Upload our own X25519 public key so peers can DM us. Fire-and-forget:
+    // failure here just means peers can't reach this device with a DM until
+    // the next successful attempt (e.g. next app start) — not fatal to any
+    // other lane, so it must never block initialize().
+    _crypto.getX25519PublicKeyBytes().then((bytes) {
+      return _publicKeyDirectory.uploadOwnPublicKey(
+        uid: _currentUserUid,
+        publicKeyBytes: bytes,
+      );
+    }).catchError((e) {
+      debugPrint('[Social] Failed to upload public key: $e');
+    });
+
+    _directMessageSub = _mesh.directMessagePackets.listen(_onDirectMessagePacket);
+
+    // Firestore receive path for DMs, mirroring the broadcast listener above
+    // but scoped to documents addressed to this user across ALL thread
+    // subcollections via a collectionGroup query (threadId varies per DM
+    // pair — see FirebaseSyncEngine._syncMessages — so we can't subscribe to
+    // a single known path the way the broadcast listener does).
+    //
+    // Requires a composite index (recipientUid ASC, timestamp ASC,
+    // COLLECTION_GROUP scope on 'records') — see firestore.indexes.json.
+    final dmSince = Timestamp.fromDate(DateTime.now());
+    _firestoreDmSub = _firestore
+        .collectionGroup(AppConstants.fsRecords)
+        .where('recipientUid', isEqualTo: _currentUserUid)
+        .where('timestamp', isGreaterThanOrEqualTo: dmSince)
+        .orderBy('timestamp', descending: false)
+        .snapshots()
+        .listen(_onFirestoreDmSnapshot, onError: (e) {
+      debugPrint('[Social] Firestore DM snapshot error: $e');
     });
   }
 
@@ -175,11 +233,105 @@ class SocialService {
     _syncEngine.syncNow().ignore();
   }
 
+  /// Send a 1:1 encrypted direct message to [recipientUid].
+  ///
+  /// Throws [StateError] if [recipientUid] has not yet uploaded an X25519
+  /// public key (e.g. never opened the app since Milestone 7 shipped) —
+  /// callers (DirectMessageScreen) should surface this as a user-facing
+  /// "can't message this person yet" error, not a silent failure.
+  ///
+  /// Encrypts with CryptoService.encryptMessage (X25519 ECDH + AES-256-GCM),
+  /// sends the ciphertext over the mesh as a PacketType.directMessage packet,
+  /// and persists locally with the PLAINTEXT we just composed in
+  /// contentEncrypted (so the UI renders it with zero decrypt step — see
+  /// MessageRecords.contentEncrypted's doc comment in tables.dart) alongside
+  /// the real ciphertext in cipherBlob for FirebaseSyncEngine to mirror.
+  Future<void> sendDirectMessage(String recipientUid, String content) async {
+    final trimmed = content.trim();
+    if (trimmed.isEmpty) return;
+
+    final recipientKey = await _publicKeyDirectory.getPublicKey(recipientUid);
+    if (recipientKey == null) {
+      throw StateError(
+        'Cannot send: recipient has not set up encryption yet.',
+      );
+    }
+
+    final encrypted = await _crypto.encryptMessage(trimmed, recipientKey);
+    final cipherBytes = encrypted.toBytes();
+
+    final msgId = const Uuid().v4();
+    final now = DateTime.now();
+
+    final packet = MeshPacket.directMessage(
+      id: msgId,
+      senderUid: _currentUserUid,
+      recipientUid: recipientUid,
+      encryptedBytes: cipherBytes,
+      ttl: AppConstants.ttlMessage,
+    );
+
+    // Mark as processed so we don't echo our own send back to the chat.
+    _markProcessed(msgId);
+
+    // ── Send over mesh ───────────────────────────────────────────────────────
+    await _mesh.sendPacket(packet);
+
+    // ── Persist locally (triggers directMessageStream) ───────────────────────
+    await _db.upsertMessage(MessageRecordsCompanion(
+      id: Value(msgId),
+      senderUid: Value(_currentUserUid),
+      contentEncrypted: Value(trimmed),
+      ttl: Value(AppConstants.ttlMessage),
+      timestamp: Value(now),
+      lane: const Value('social'),
+      synced: const Value(false),
+      isRead: const Value(true), // Own messages are always "read"
+      recipientUid: Value(recipientUid),
+      cipherBlob: Value(base64Encode(cipherBytes)),
+    ));
+
+    // ── Sync to Firestore (best-effort, non-blocking) ─────────────────────────
+    _syncEngine.syncNow().ignore();
+  }
+
+  /// Search the campus roster by display name (case-insensitive, substring
+  /// match). Used by the DM "search by name" entry point — no username
+  /// field exists in this schema, so display name is the only practical
+  /// search basis (decided over tap-only entry, since not every conversation
+  /// starts from a visible broadcast message).
+  ///
+  /// Bounded client-side filter over a single read of the users collection:
+  /// Firestore has no native case-insensitive search, and this app targets
+  /// a single institution's roster (hundreds, not millions, of users) — an
+  /// acceptable read-cost tradeoff at this scale. Revisit with a dedicated
+  /// search index (Algolia/Typesense) if this ever needs to scale beyond
+  /// one institution.
+  Future<List<({String uid, String name})>> searchUsersByName(
+    String query,
+  ) async {
+    final needle = query.trim().toLowerCase();
+    if (needle.isEmpty) return [];
+
+    final snapshot = await _firestore.collection(AppConstants.fsUsers).get();
+    final results = <({String uid, String name})>[];
+    for (final doc in snapshot.docs) {
+      if (doc.id == _currentUserUid) continue; // can't DM yourself
+      final name = (doc.data()['name'] as String?)?.trim() ?? '';
+      if (name.toLowerCase().contains(needle)) {
+        results.add((uid: doc.id, name: name));
+      }
+    }
+    return results;
+  }
+
   // ── Dispose ────────────────────────────────────────────────────────────────
 
   Future<void> dispose() async {
     await _packetSub?.cancel();
     await _firestoreSub?.cancel();
+    await _directMessageSub?.cancel();
+    await _firestoreDmSub?.cancel();
     _processedPacketIds.clear();
     _processedPacketOrder.clear();
   }
@@ -231,6 +383,143 @@ class SocialService {
     _syncEngine.syncNow().ignore();
   }
 
+  /// Handle an incoming direct-message packet from the mesh.
+  ///
+  /// Relay nodes see EVERY directMessage packet in transit, addressed to
+  /// peers they may not be — they must forward (handled generically by
+  /// MeshService._scheduleRelay, unrelated to this method) WITHOUT attempting
+  /// to decrypt anything not addressed to them. This gate is the
+  /// confidentiality boundary: only a packet whose recipientUid matches our
+  /// own UID proceeds to decryption.
+  void _onDirectMessagePacket(MeshPacket packet) {
+    if (packet.senderUid == _currentUserUid) return; // our own send, echoed
+
+    final decoded = packet.decodeDirectMessagePayload();
+    if (decoded == null) return;
+
+    // Not addressed to this device — we're just relaying it. Do NOT decrypt.
+    if (decoded.recipientUid != _currentUserUid) return;
+
+    // Deduplicate — mesh relay can deliver the same packet multiple times.
+    if (!_markProcessed(packet.id)) return;
+
+    _decryptAndStoreDirectMessage(
+      msgId: packet.id,
+      senderUid: packet.senderUid,
+      recipientUid: decoded.recipientUid,
+      encryptedBytes: decoded.encryptedBytes,
+      timestamp: packet.timestamp,
+      ttl: packet.ttl,
+      markSynced: false,
+    ).ignore();
+  }
+
+  /// Shared by both receive paths (BLE mesh and Firestore collectionGroup):
+  /// looks up the sender's X25519 public key, decrypts via ECDH + AES-256-GCM
+  /// (CryptoService.decryptMessage), and persists the result. Silently drops
+  /// the message (with a debug log) on missing key or auth failure — both are
+  /// recoverable on the NEXT delivery attempt (mesh retry / Firestore resync),
+  /// so there's no good user-facing action to take on a single failed attempt.
+  Future<void> _decryptAndStoreDirectMessage({
+    required String msgId,
+    required String senderUid,
+    required String recipientUid,
+    required Uint8List encryptedBytes,
+    required DateTime timestamp,
+    required int ttl,
+    required bool markSynced,
+  }) async {
+    final encrypted = EncryptedMessage.fromBytes(encryptedBytes);
+    if (encrypted == null) {
+      debugPrint('[Social] DM $msgId from $senderUid: malformed ciphertext');
+      return;
+    }
+
+    final senderKey = await _publicKeyDirectory.getPublicKey(senderUid);
+    if (senderKey == null) {
+      debugPrint(
+        '[Social] DM $msgId from $senderUid: no public key on file, cannot decrypt',
+      );
+      return;
+    }
+
+    String plaintext;
+    try {
+      plaintext = await _crypto.decryptMessage(encrypted, senderKey);
+    } catch (e) {
+      debugPrint('[Social] DM $msgId from $senderUid: decrypt failed — $e');
+      return;
+    }
+
+    await _db.upsertMessage(MessageRecordsCompanion(
+      id: Value(msgId),
+      senderUid: Value(senderUid),
+      contentEncrypted: Value(plaintext),
+      ttl: Value(ttl),
+      timestamp: Value(timestamp),
+      lane: const Value('social'),
+      synced: Value(markSynced),
+      isRead: const Value(false),
+      recipientUid: Value(recipientUid),
+      cipherBlob: Value(base64Encode(encryptedBytes)),
+    ));
+
+    if (!markSynced) {
+      _syncEngine.syncNow().ignore();
+    }
+  }
+
+  /// Handle a Firestore collectionGroup snapshot of DMs addressed to us.
+  ///
+  /// Unlike the broadcast path, the Firestore 'contentEncrypted' field for a
+  /// DM document holds base64 CIPHERTEXT (FirebaseSyncEngine never uploads DM
+  /// plaintext) — decode and decrypt it here, mirroring
+  /// _decryptAndStoreDirectMessage's BLE counterpart.
+  void _onFirestoreDmSnapshot(QuerySnapshot<Map<String, dynamic>> snapshot) {
+    for (final change in snapshot.docChanges) {
+      if (change.type != DocumentChangeType.added) continue;
+
+      final data = change.doc.data();
+      if (data == null) continue;
+
+      final id = data['id'] as String?;
+      final senderUid = data['senderUid'] as String?;
+      final recipientUid = data['recipientUid'] as String?;
+      final cipherB64 = data['contentEncrypted'] as String?;
+      final ttl = (data['ttl'] as num?)?.toInt();
+      final tsRaw = data['timestamp'];
+
+      if (id == null ||
+          senderUid == null ||
+          recipientUid == null ||
+          cipherB64 == null ||
+          ttl == null ||
+          tsRaw == null) {
+        continue;
+      }
+
+      // Our own DM, already stored locally at send time.
+      if (senderUid == _currentUserUid) continue;
+
+      // Deduplicate — might have already arrived via BLE mesh.
+      if (!_markProcessed(id)) continue;
+
+      final timestamp = tsRaw is Timestamp ? tsRaw.toDate() : DateTime.now();
+
+      debugPrint('[Social] Firestore DM from $senderUid');
+
+      _decryptAndStoreDirectMessage(
+        msgId: id,
+        senderUid: senderUid,
+        recipientUid: recipientUid,
+        encryptedBytes: Uint8List.fromList(base64Decode(cipherB64)),
+        timestamp: timestamp,
+        ttl: ttl,
+        markSynced: true, // Already in Firestore.
+      ).ignore();
+    }
+  }
+
   /// Handle a Firestore snapshot from the 'broadcast' thread.
   ///
   /// Fires for both added and modified documents. We only care about new
@@ -250,7 +539,9 @@ class SocialService {
       final tsRaw = data['timestamp'];
 
       if (id == null || senderUid == null || content == null ||
-          ttl == null || tsRaw == null) continue;
+          ttl == null || tsRaw == null) {
+        continue;
+      }
 
       // Deduplicate — might have already arrived via BLE mesh.
       if (!_markProcessed(id)) continue;

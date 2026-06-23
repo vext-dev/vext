@@ -67,6 +67,13 @@ class MockMeshService extends _i1.Mock implements _i2.MeshService {
       ) as _i4.Stream<_i5.MeshPacket>);
 
   @override
+  _i4.Stream<_i5.MeshPacket> get directMessagePackets => (super.noSuchMethod(
+        Invocation.getter(#directMessagePackets),
+        returnValue: _i4.Stream<_i5.MeshPacket>.empty(),
+        returnValueForMissingStub: _i4.Stream<_i5.MeshPacket>.empty(),
+      ) as _i4.Stream<_i5.MeshPacket>);
+
+  @override
   _i4.Stream<_i2.AttendanceAdvertisement> get attendanceAdvertisements =>
       (super.noSuchMethod(
         Invocation.getter(#attendanceAdvertisements),
