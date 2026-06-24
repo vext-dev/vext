@@ -1,0 +1,88 @@
+name: Deploy Firestore Rules & Indexes
+
+# ── Why this workflow exists ────────────────────────────────────────────────
+#
+# Firestore security rules (firestore.rules) and indexes (firestore.indexes.json)
+# do NOT deploy with the Flutter app build. They only take effect after an
+# explicit `firebase deploy --only firestore:rules,firestore:indexes` run.
+#
+# That manual step was missed after commit 2e28c58 added the public_keys
+# collection + its rule, which caused every DM to fail with
+# `[cloud_firestore/permission-denied]` until the rules were deployed by hand.
+#
+# This workflow removes the human-memory dependency: any push to `main` that
+# touches firestore.rules or firestore.indexes.json deploys automatically.
+# Feature branches and PRs are untouched — only merges to `main` go live,
+# same as the manual process this replaces.
+#
+# ── One-time setup required (cannot be done from this repo alone) ──────────
+#
+# 1. In Google Cloud Console for project `vext-vigilantmesh-57551`, create a
+#    service account with the "Firebase Rules Admin", "Cloud Datastore Index
+#    Admin", AND "Service Usage Consumer" roles (or "Editor" if you want a
+#    single broad role). The third role is easy to miss — without it, the
+#    Firebase CLI's own "is this API enabled" check 403s before it ever
+#    reaches the actual deploy.
+# 2. Generate a JSON key for that service account.
+# 3. In GitHub: Settings → Secrets and variables → Actions → New repository
+#    secret, name it FIREBASE_SERVICE_ACCOUNT, and paste the full JSON key
+#    contents as the value.
+#
+# Until that secret exists, this workflow will fail at the "Authenticate"
+# step — it will NOT silently skip, so a missing secret is loud, not silent.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'firestore.rules'
+      - 'firestore.indexes.json'
+  # Lets you trigger a manual re-deploy from the Actions tab without needing
+  # a new commit — e.g. to backfill a deploy that was missed in the past.
+  workflow_dispatch: {}
+
+jobs:
+  deploy-rules:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Firebase CLI
+        run: npm install -g firebase-tools
+
+      - name: Authenticate to Firebase
+        env:
+          # Passed in via `env:` rather than interpolated straight into the
+          # script below. GitHub Actions substitutes `${{ secrets.X }}` as raw
+          # text wherever it appears, and this secret is a JSON blob full of
+          # double quotes — inlined directly inside the script's own quotes,
+          # those quotes collide with the script's and corrupt the `[ -z ]`
+          # check (this is what caused the "too many arguments" error seen in
+          # run #1). Routing it through an env var lets bash quote it safely
+          # instead.
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          if [ -z "$FIREBASE_SERVICE_ACCOUNT_JSON" ]; then
+            echo "::error::FIREBASE_SERVICE_ACCOUNT secret is not set. See the setup notes at the top of this workflow file."
+            exit 1
+          fi
+          printf '%s' "$FIREBASE_SERVICE_ACCOUNT_JSON" > "$RUNNER_TEMP/firebase-service-account.json"
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/firebase-service-account.json" >> "$GITHUB_ENV"
+
+      - name: Deploy Firestore rules & indexes
+        run: |
+          firebase deploy \
+            --only firestore:rules,firestore:indexes \
+            --project vext-vigilantmesh-57551 \
+            --non-interactive
+
+      - name: Clean up credentials
+        if: always()
+        run: rm -f "$RUNNER_TEMP/firebase-service-account.json"
