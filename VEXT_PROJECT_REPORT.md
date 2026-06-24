@@ -281,7 +281,7 @@ The `FirebaseSyncEngine` has no concept of session documents. It syncs proofs, m
 
 - Schema migrations on mobile are irreversible on user devices. A wrong migration crashes the app on every startup until clean install.
 - `FirebaseSyncEngine` changes affect proof, message, and SOS sync simultaneously. A bug here breaks all three lanes.
-- Firestore rules require a separate deployment step outside the Flutter build process.
+- Firestore rules require a separate deployment step outside the Flutter build process — as of `.github/workflows/firestore-rules-deploy.yml`, this is automated on merge to `main` (provided the `FIREBASE_SERVICE_ACCOUNT` secret is configured), but Track 2 work should still confirm the relaxed rule actually deploys before relying on it.
 - The Track 1 fix (one line) already makes the current flow functionally correct. Track 2 eliminates the race window and adds resilience — it is a quality improvement, not a correctness fix.
 
 ### Prerequisites before starting Track 2
