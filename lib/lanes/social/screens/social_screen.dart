@@ -109,7 +109,8 @@ class _SocialScreenState extends ConsumerState<SocialScreen> {
   Future<void> _openUserSearch() async {
     final svc = ref.read(socialServiceProvider).valueOrNull;
     if (svc == null) return;
-    final selected = await showModalBottomSheet<({String uid, String name})>(
+    final selected = await showModalBottomSheet<
+        ({String uid, String name, String username})>(
       context: context,
       backgroundColor: _kSurface,
       isScrollControlled: true,
@@ -604,12 +605,11 @@ class _ServiceErrorView extends StatelessWidget {
 
 // ── User search sheet ─────────────────────────────────────────────────────────
 //
-// The "search using the username" DM entry point. There's no separate
-// username field in this app — search is by display name (users/{uid}.name),
-// matching SocialService.searchUsersByName and the existing sender-name
-// lookup pattern used elsewhere in this screen.
+// The "search by name or username" DM entry point. Matches against either
+// display name (users/{uid}.name) or username (users/{uid}.username) — see
+// SocialService.searchUsersByName, which checks both fields.
 //
-// Pops with the selected (uid, name) record, or null if dismissed.
+// Pops with the selected (uid, name, username) record, or null if dismissed.
 
 class _UserSearchSheet extends StatefulWidget {
   const _UserSearchSheet({required this.service});
@@ -622,7 +622,7 @@ class _UserSearchSheet extends StatefulWidget {
 
 class _UserSearchSheetState extends State<_UserSearchSheet> {
   final _searchController = TextEditingController();
-  List<({String uid, String name})> _results = [];
+  List<({String uid, String name, String username})> _results = [];
   bool _loading = false;
   String? _error;
 
@@ -700,7 +700,7 @@ class _UserSearchSheetState extends State<_UserSearchSheet> {
             style: const TextStyle(color: _kTextPrimary, fontSize: 14),
             onChanged: _runSearch,
             decoration: InputDecoration(
-              hintText: 'Search by name…',
+              hintText: 'Search by name or username…',
               hintStyle: const TextStyle(color: _kHint, fontSize: 14),
               prefixIcon:
                   const Icon(Icons.search_rounded, color: _kHint, size: 20),
@@ -754,7 +754,7 @@ class _UserSearchSheetState extends State<_UserSearchSheet> {
                             padding: const EdgeInsets.symmetric(vertical: 16),
                             child: Text(
                               _searchController.text.trim().isEmpty
-                                  ? 'Type a name to find someone'
+                                  ? 'Type a name or username to find someone'
                                   : 'No matches',
                               style: const TextStyle(
                                   color: _kTextSecondary, fontSize: 13),
@@ -782,6 +782,14 @@ class _UserSearchSheetState extends State<_UserSearchSheet> {
                                   style: const TextStyle(
                                       color: _kTextPrimary, fontSize: 14),
                                 ),
+                                subtitle: r.username.isNotEmpty
+                                    ? Text(
+                                        '@${r.username}',
+                                        style: const TextStyle(
+                                            color: _kTextSecondary,
+                                            fontSize: 12),
+                                      )
+                                    : null,
                                 onTap: () => Navigator.of(context).pop(r),
                               );
                             },

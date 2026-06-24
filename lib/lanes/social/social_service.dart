@@ -295,11 +295,11 @@ class SocialService {
     _syncEngine.syncNow().ignore();
   }
 
-  /// Search the campus roster by display name (case-insensitive, substring
-  /// match). Used by the DM "search by name" entry point — no username
-  /// field exists in this schema, so display name is the only practical
-  /// search basis (decided over tap-only entry, since not every conversation
-  /// starts from a visible broadcast message).
+  /// Search the campus roster by display name OR username (case-insensitive,
+  /// substring match against either field). Used by the DM "search" entry
+  /// point — matches on whichever the searcher typed (full name like
+  /// "Student Test Two" or username like "student.test2"), since not every
+  /// conversation starts from a visible broadcast message.
   ///
   /// Bounded client-side filter over a single read of the users collection:
   /// Firestore has no native case-insensitive search, and this app targets
@@ -307,19 +307,23 @@ class SocialService {
   /// acceptable read-cost tradeoff at this scale. Revisit with a dedicated
   /// search index (Algolia/Typesense) if this ever needs to scale beyond
   /// one institution.
-  Future<List<({String uid, String name})>> searchUsersByName(
+  Future<List<({String uid, String name, String username})>> searchUsersByName(
     String query,
   ) async {
     final needle = query.trim().toLowerCase();
     if (needle.isEmpty) return [];
 
     final snapshot = await _firestore.collection(AppConstants.fsUsers).get();
-    final results = <({String uid, String name})>[];
+    final results = <({String uid, String name, String username})>[];
     for (final doc in snapshot.docs) {
       if (doc.id == _currentUserUid) continue; // can't DM yourself
-      final name = (doc.data()['name'] as String?)?.trim() ?? '';
-      if (name.toLowerCase().contains(needle)) {
-        results.add((uid: doc.id, name: name));
+      final data = doc.data();
+      final name = (data['name'] as String?)?.trim() ?? '';
+      final username = (data['username'] as String?)?.trim() ?? '';
+      final matches = name.toLowerCase().contains(needle) ||
+          (username.isNotEmpty && username.toLowerCase().contains(needle));
+      if (matches) {
+        results.add((uid: doc.id, name: name, username: username));
       }
     }
     return results;

@@ -17,6 +17,15 @@ class VextUser {
   final String role; // '' | student | teacher | security
   final String institutionId;
   final String publicKeyFingerprint; // set after crypto init
+  // Auto-derived from the email local-part at account-creation time (see
+  // [usernameFromEmail]) — e.g. "shreshthaba.cs24@bmsce.ac.in" → username
+  // "shreshthaba.cs24". Guaranteed unique because email is unique (Firebase
+  // Auth enforces one account per email). Used for social search; not shown
+  // in Attendance or elsewhere yet. '' for accounts created before this
+  // field existed (self-heals to non-empty on their next sign-in, since
+  // signInWithEmail's self-healing path only runs when the Firestore doc is
+  // missing entirely — existing docs keep whatever value is already there).
+  final String username;
 
   const VextUser({
     required this.uid,
@@ -25,7 +34,18 @@ class VextUser {
     required this.role,
     required this.institutionId,
     this.publicKeyFingerprint = '',
+    this.username = '',
   });
+
+  /// Derives the username from an email's local-part (everything before
+  /// the '@'), lowercased. Does not validate the email is well-formed —
+  /// callers (signUpWithEmail, signInWithEmail) already gate on
+  /// [AuthService.isAllowedDomain] before this runs.
+  static String usernameFromEmail(String email) {
+    final trimmed = email.trim().toLowerCase();
+    final at = trimmed.indexOf('@');
+    return at == -1 ? trimmed : trimmed.substring(0, at);
+  }
 
   factory VextUser.fromMap(String uid, Map<String, dynamic> data) {
     return VextUser(
@@ -37,6 +57,7 @@ class VextUser {
       role: data['role'] as String? ?? '',
       institutionId: data['institution_id'] as String? ?? '',
       publicKeyFingerprint: data['public_key'] as String? ?? '',
+      username: data['username'] as String? ?? '',
     );
   }
 
@@ -50,6 +71,7 @@ class VextUser {
         'role': role,
         'institution_id': institutionId,
         'public_key': publicKeyFingerprint,
+        'username': username,
       };
 
   /// Full document map for INITIAL document creation only.
@@ -70,7 +92,11 @@ class VextUser {
             : FieldValue.serverTimestamp(),
       };
 
-  VextUser copyWith({String? role, String? publicKeyFingerprint}) {
+  VextUser copyWith({
+    String? role,
+    String? publicKeyFingerprint,
+    String? username,
+  }) {
     return VextUser(
       uid: uid,
       email: email,
@@ -79,6 +105,7 @@ class VextUser {
       institutionId: institutionId,
       publicKeyFingerprint:
           publicKeyFingerprint ?? this.publicKeyFingerprint,
+      username: username ?? this.username,
     );
   }
 }
@@ -294,6 +321,7 @@ class AuthService {
       displayName: name,
       role: '',            // NO default role — user must select in RoleSelectionScreen
       institutionId: 'default',
+      username: VextUser.usernameFromEmail(email),
     );
 
     // Use toInitialMap() — writes created_at exactly once, on account creation.
@@ -343,6 +371,7 @@ class AuthService {
         displayName: firebaseUser.displayName ?? '',
         role: '',
         institutionId: 'default',
+        username: VextUser.usernameFromEmail(firebaseUser.email ?? email),
       );
       // Use toInitialMap() with the Auth account's true creation time so
       // created_at reflects when the account was CREATED (Firebase Auth
