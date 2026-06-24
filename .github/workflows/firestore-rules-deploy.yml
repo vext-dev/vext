@@ -18,8 +18,11 @@ name: Deploy Firestore Rules & Indexes
 # ── One-time setup required (cannot be done from this repo alone) ──────────
 #
 # 1. In Google Cloud Console for project `vext-vigilantmesh-57551`, create a
-#    service account with the "Firebase Rules Admin" and "Cloud Datastore
-#    Index Admin" roles (or "Editor" if you want a single broad role).
+#    service account with the "Firebase Rules Admin", "Cloud Datastore Index
+#    Admin", AND "Service Usage Consumer" roles (or "Editor" if you want a
+#    single broad role). The third role is easy to miss — without it, the
+#    Firebase CLI's own "is this API enabled" check 403s before it ever
+#    reaches the actual deploy.
 # 2. Generate a JSON key for that service account.
 # 3. In GitHub: Settings → Secrets and variables → Actions → New repository
 #    secret, name it FIREBASE_SERVICE_ACCOUNT, and paste the full JSON key
@@ -55,12 +58,22 @@ jobs:
         run: npm install -g firebase-tools
 
       - name: Authenticate to Firebase
+        env:
+          # Passed in via `env:` rather than interpolated straight into the
+          # script below. GitHub Actions substitutes `${{ secrets.X }}` as raw
+          # text wherever it appears, and this secret is a JSON blob full of
+          # double quotes — inlined directly inside the script's own quotes,
+          # those quotes collide with the script's and corrupt the `[ -z ]`
+          # check (this is what caused the "too many arguments" error seen in
+          # run #1). Routing it through an env var lets bash quote it safely
+          # instead.
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
         run: |
-          if [ -z "${{ secrets.FIREBASE_SERVICE_ACCOUNT }}" ]; then
+          if [ -z "$FIREBASE_SERVICE_ACCOUNT_JSON" ]; then
             echo "::error::FIREBASE_SERVICE_ACCOUNT secret is not set. See the setup notes at the top of this workflow file."
             exit 1
           fi
-          echo '${{ secrets.FIREBASE_SERVICE_ACCOUNT }}' > "$RUNNER_TEMP/firebase-service-account.json"
+          printf '%s' "$FIREBASE_SERVICE_ACCOUNT_JSON" > "$RUNNER_TEMP/firebase-service-account.json"
           echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/firebase-service-account.json" >> "$GITHUB_ENV"
 
       - name: Deploy Firestore rules & indexes
