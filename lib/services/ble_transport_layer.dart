@@ -125,6 +125,19 @@ class BleTransportLayer {
   bool _running = false;
   ScanDutyMode _dutyMode = ScanDutyMode.idle;
 
+  /// True only once the Kotlin BleAdvertiser has confirmed advertising is
+  /// actually broadcasting (set from _startHeartbeat()'s success/failure
+  /// paths). Distinguishes "_running is true because start() began" from
+  /// "advertising is actually up" — see the early-return branch in start()
+  /// for why that distinction matters (BUG: attendance session needing to be
+  /// started twice).
+  bool _advertisingActive = false;
+
+  /// Guards against overlapping retries if start() is called again (e.g. a
+  /// session lock being acquired) while a previous advertising retry is
+  /// still in flight.
+  bool _advertisingRetryInFlight = false;
+
   /// Number of GATT client operations currently in-flight.
   /// Capped at [AppConstants.maxConcurrentGattConnections] to prevent BLE
   /// radio exhaustion. Incremented at the start of sendPacketToPeer(),
@@ -204,6 +217,20 @@ class BleTransportLayer {
       // to idle (31 s cycle), causing a spurious duty-cycle restart.
       _restartDutyCycle();
       _scheduleDozeAlarm().ignore();
+
+      // Self-heal: a previous start() call may have set _running = true but
+      // failed to actually get advertising up (e.g. a BLUETOOTH_ADVERTISE
+      // permission-grant race, or the adapter not being ready yet — see
+      // _startHeartbeat()'s non-fatal catch). Once _running is true, THIS
+      // branch is the only path any later start() call takes — without this
+      // check, advertising would never be retried until an explicit
+      // stop()+start() cycle (exactly the "turn the session off and on
+      // again" workaround). Retrying here makes every start() call
+      // (including AttendanceService acquiring the session lock) self-heal
+      // instead of only the very first one.
+      if (!_advertisingActive) {
+        _retryAdvertising().ignore();
+      }
       return;
     }
 
@@ -292,6 +319,7 @@ class BleTransportLayer {
   /// Stop all scanning, advertising, and GATT operations.
   Future<void> stop() async {
     _running = false;
+    _advertisingActive = false;
 
     _dutyCycleTimer?.cancel();
     _dutyCycleTimer = null;
@@ -614,6 +642,7 @@ class BleTransportLayer {
         {'payload': <int>[]}, // empty = service UUID only in primary advertisement
       );
       debugPrint('[BLE] Advertising started — VEXT service UUID visible to peers');
+      _advertisingActive = true;
       onAdvertisingStateChanged?.call(true, '');
     } on PlatformException catch (e) {
       // Known error codes from BleAdvertiser.kt:
@@ -622,10 +651,29 @@ class BleTransportLayer {
       //   BLE_UNAVAILABLE     — device has no BLE peripheral hardware
       final msg = _humanReadableAdvertiseError(e);
       debugPrint('[BLE] Advertising FAILED: ${e.code} — ${e.message}');
+      _advertisingActive = false;
       onAdvertisingStateChanged?.call(false, msg);
     } catch (e) {
       debugPrint('[BLE] Advertising FAILED (unexpected): $e');
+      _advertisingActive = false;
       onAdvertisingStateChanged?.call(false, e.toString());
+    }
+  }
+
+  /// Re-attempts the permission-request + advertising-start sequence without
+  /// re-running the rest of start()'s one-time setup (GATT server, scan
+  /// listeners, duty-cycle/eviction/watchdog timers — those are already
+  /// running from the original start() call). Called from start()'s
+  /// early-return branch when a previous attempt left advertising inactive.
+  Future<void> _retryAdvertising() async {
+    if (_advertisingRetryInFlight) return;
+    _advertisingRetryInFlight = true;
+    try {
+      debugPrint('[BLE] Retrying advertising start (previous attempt left it inactive)');
+      await _requestBlePermissions();
+      await _startHeartbeat();
+    } finally {
+      _advertisingRetryInFlight = false;
     }
   }
 
