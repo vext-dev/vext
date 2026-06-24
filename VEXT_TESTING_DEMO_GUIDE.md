@@ -573,6 +573,6 @@ Test 6C (retry after rejection): PASS / FAIL    notes:
    ```
    Without this, the app compiles but the unique constraint is not enforced. The in-memory `_inProgressSessionIds` guard still prevents duplicates at runtime.
 
-6. **Firestore rules required** — The app assumes Firestore security rules are deployed. If they aren't, proof syncing will fail silently (Drift keeps data safe, sync retries every 10s).
+6. **Firestore rules required** — The app assumes Firestore security rules are deployed. If they aren't, proof syncing will fail silently (Drift keeps data safe, sync retries every 10s). As of `.github/workflows/firestore-rules-deploy.yml`, rules/indexes auto-deploy on every merge to `main` that touches `firestore.rules` or `firestore.indexes.json` — this requires the one-time `FIREBASE_SERVICE_ACCOUNT` GitHub secret to be set (see the workflow file's header comment). Without that secret, the workflow fails loudly rather than silently skipping.
 
 7. **GPS geofence requires a real outdoor-ish fix on both sides** — indoor/low-accuracy fixes (> 50 m accuracy) are silently discarded, which falls back to RSSI-only for that session/student rather than failing the demo. See §11 for the manual test procedure (not run from this sandbox — needs real device GPS).
