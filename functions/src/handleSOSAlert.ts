@@ -5,16 +5,23 @@
  *
  * Flow:
  *   1. Read the new SOS document (senderUid, latitude, longitude, timestamp).
- *   2. Query the `users` collection for all documents where role == 'security'.
- *   3. Collect every non-empty fcmToken field from those documents.
- *   4. Send an FCM multicast push notification to all security tokens.
+ *   2. Query the entire `users` collection (all roles — student, teacher,
+ *      security). Originally scoped to role == 'security' only; broadened
+ *      in Phase 1 (2026-06-24) so everyone nearby with internet is alerted,
+ *      not just security. The BLE mesh broadcast (offline path) was already
+ *      unscoped by role — this aligns the FCM/online path with it.
+ *   3. Collect every non-empty fcmToken field from those documents, EXCLUDING
+ *      the sender's own document — the person who triggered SOS should not
+ *      also receive a push about their own alert.
+ *   4. Send an FCM multicast push notification to all collected tokens.
  *   5. Log success / failure counts; do NOT throw on partial FCM failure
  *      (some tokens may be stale — this is expected and should not block).
  *
- * M5 exit criterion: FCM push arrives on a security device in < 5 seconds
- * from the moment the student triggers SOS. End-to-end path:
- *   Student device → Drift → FirebaseSyncEngine → Firestore → this function
- *   → FCM → Security device notification
+ * M5 exit criterion (originally security-only, now all roles): FCM push
+ * arrives on a recipient device in < 5 seconds from the moment the sender
+ * triggers SOS. End-to-end path:
+ *   Sender device → Drift → FirebaseSyncEngine → Firestore → this function
+ *   → FCM → All other devices (student/teacher/security) notification
  *
  * Deploy:
  *   cd functions && npm install && firebase deploy --only functions:handleSOSAlert
@@ -37,7 +44,6 @@ import { GlobalOptions } from 'firebase-functions/v2';
 // ── Firestore collection names (mirrors AppConstants) ─────────────────────────
 const FS_USERS = 'users';
 const FS_SOS_EVENTS = 'sos_events';
-const ROLE_SECURITY = 'security';
 
 // ── Notification copy ─────────────────────────────────────────────────────────
 const NOTIF_TITLE = '🚨 SOS Emergency Alert';
@@ -79,29 +85,28 @@ export const handleSOSAlert = onDocumentCreated(
         `lat=${latitude} lng=${longitude}`
     );
 
-    // ── 1. Fetch all security-role users ────────────────────────────────────
+    // ── 1. Fetch all users (every role — broadened from security-only) ──────
     const db = admin.firestore();
-    let securityUsersSnap: admin.firestore.QuerySnapshot;
+    let allUsersSnap: admin.firestore.QuerySnapshot;
 
     try {
-      securityUsersSnap = await db
-        .collection(FS_USERS)
-        .where('role', '==', ROLE_SECURITY)
-        .get();
+      allUsersSnap = await db.collection(FS_USERS).get();
     } catch (err) {
-      console.error('handleSOSAlert: failed to query security users', err);
+      console.error('handleSOSAlert: failed to query users', err);
       return;
     }
 
-    if (securityUsersSnap.empty) {
-      console.log('handleSOSAlert: no security users found, nothing to notify');
+    if (allUsersSnap.empty) {
+      console.log('handleSOSAlert: no users found, nothing to notify');
       return;
     }
 
-    // ── 2. Collect FCM tokens ────────────────────────────────────────────────
+    // ── 2. Collect FCM tokens, excluding the sender ──────────────────────────
     const tokens: string[] = [];
 
-    securityUsersSnap.forEach((doc) => {
+    allUsersSnap.forEach((doc) => {
+      if (doc.id === senderUid) return; // don't notify the originator
+
       const userData = doc.data();
       const token: string | undefined = userData.fcmToken;
       if (token && token.trim().length > 0) {
@@ -111,13 +116,13 @@ export const handleSOSAlert = onDocumentCreated(
 
     if (tokens.length === 0) {
       console.log(
-        'handleSOSAlert: security users found but none have fcmToken, skipping'
+        'handleSOSAlert: no other users have an fcmToken, skipping'
       );
       return;
     }
 
     console.log(
-      `handleSOSAlert: sending FCM to ${tokens.length} security device(s)`
+      `handleSOSAlert: sending FCM to ${tokens.length} device(s) across all roles`
     );
 
     // ── 3. Send multicast FCM push ───────────────────────────────────────────
