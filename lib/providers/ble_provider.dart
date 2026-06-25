@@ -48,6 +48,8 @@ class BleState {
     this.peerCount = 0,
     this.advertisingActive = false,
     this.advertisingError = '',
+    this.scanActive = false,
+    this.scanError = '',
   });
 
   final bool isActive;
@@ -62,12 +64,28 @@ class BleState {
   /// Empty when advertisingActive = true (success) or before start() is called.
   final String advertisingError;
 
+  /// True when FlutterBluePlus.startScan() last succeeded.
+  /// False before start() is called, or when scanning failed to start
+  /// (e.g. BLUETOOTH_SCAN / ACCESS_FINE_LOCATION denied, or Bluetooth/Location
+  /// toggled off on the device). Added 2026-06-25 — previously scan failures
+  /// were completely silent (see ble_transport_layer.dart history).
+  final bool scanActive;
+
+  /// Non-empty when starting the scan failed — human-readable error for the UI.
+  final String scanError;
+
+  /// True if either advertising or scanning currently has an unresolved error.
+  /// The UI uses this to decide whether to show a warning affordance at all.
+  bool get hasBleError => advertisingError.isNotEmpty || scanError.isNotEmpty;
+
   BleState copyWith({
     bool? isActive,
     MeshMode? mode,
     int? peerCount,
     bool? advertisingActive,
     String? advertisingError,
+    bool? scanActive,
+    String? scanError,
   }) {
     return BleState(
       isActive: isActive ?? this.isActive,
@@ -75,6 +93,8 @@ class BleState {
       peerCount: peerCount ?? this.peerCount,
       advertisingActive: advertisingActive ?? this.advertisingActive,
       advertisingError: advertisingError ?? this.advertisingError,
+      scanActive: scanActive ?? this.scanActive,
+      scanError: scanError ?? this.scanError,
     );
   }
 }
@@ -92,6 +112,13 @@ class BleStateNotifier extends StateNotifier<BleState> {
       state = state.copyWith(
         advertisingActive: isAdvertising,
         advertisingError: error,
+      );
+    };
+
+    _transport.onScanStateChanged = (isScanning, error) {
+      state = state.copyWith(
+        scanActive: isScanning,
+        scanError: error,
       );
     };
   }

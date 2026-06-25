@@ -170,6 +170,44 @@ class _AppShellScreenState extends ConsumerState<AppShellScreen>
     }
   }
 
+  /// Shows the raw BLE advertising/scan error so the user can actually see
+  /// WHY mesh isn't working instead of just "MESH OFF" with no explanation.
+  ///
+  /// Added 2026-06-25: previously the only place these errors were visible
+  /// at all was the debug-only TestScreen (slated for removal). On a real
+  /// device with a denied permission or Bluetooth/Location toggled off, every
+  /// production screen showed nothing — peers just never appeared, looking
+  /// identical to "the feature is broken" from the user's side.
+  void _showBleDiagnostics(BuildContext context, BleState bleState) {
+    final messages = <String>[];
+    if (bleState.advertisingError.isNotEmpty) {
+      messages.add('Advertising: ${bleState.advertisingError}');
+    }
+    if (bleState.scanError.isNotEmpty) {
+      messages.add('Scanning: ${bleState.scanError}');
+    }
+    if (messages.isEmpty) {
+      messages.add(bleState.isActive
+          ? 'Mesh is active — advertising: ${bleState.advertisingActive}, '
+              'scanning: ${bleState.scanActive}, peers: ${bleState.peerCount}.'
+          : 'Mesh has not started yet.');
+    }
+
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Mesh diagnostics'),
+        content: Text(messages.join('\n\n')),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final currentIndex = _currentIndex(context);
@@ -177,6 +215,7 @@ class _AppShellScreenState extends ConsumerState<AppShellScreen>
     // Watch BLE connection state — replace bleActiveProvider with your actual
     // provider. It should expose a bool (true = BLE active / connected).
     final isBleActive = ref.watch(bleActiveProvider);
+    final bleState = ref.watch(bleStateProvider);
 
     return Scaffold(
       backgroundColor: AppTheme.backgroundColor,
@@ -202,7 +241,11 @@ class _AppShellScreenState extends ConsumerState<AppShellScreen>
           ),
         ),
         actions: [
-          _BleStatusIndicator(isActive: isBleActive),
+          _BleStatusIndicator(
+            isActive: isBleActive,
+            hasError: bleState.hasBleError,
+            onTap: () => _showBleDiagnostics(context, bleState),
+          ),
           const SizedBox(width: 16),
         ],
       ),
@@ -390,58 +433,81 @@ class _SosBadge extends StatelessWidget {
 // ── BLE status indicator ──────────────────────────────────────────────────────
 
 class _BleStatusIndicator extends StatelessWidget {
-  const _BleStatusIndicator({required this.isActive});
+  const _BleStatusIndicator({
+    required this.isActive,
+    this.hasError = false,
+    this.onTap,
+  });
 
   final bool isActive;
 
+  /// True when advertising or scanning has an unresolved error (e.g. denied
+  /// permission, Bluetooth/Location off). Takes priority over [isActive]'s
+  /// color so a "started but broken" mesh is visibly distinct from a healthy
+  /// one — previously both looked identical (just MESH ON, green).
+  final bool hasError;
+
+  /// Tap to see the actual error text. Always wired so the indicator is
+  /// useful even when there's no error (shows current state).
+  final VoidCallback? onTap;
+
   @override
   Widget build(BuildContext context) {
-    final dotColor =
-        isActive ? _AppShellColors.bleActive : _AppShellColors.bleInactive;
-    final label = isActive ? 'MESH ON' : 'MESH OFF';
-    final labelColor = isActive
-        ? _AppShellColors.bleActive
-        : _AppShellColors.bleInactiveLabel;
+    final dotColor = hasError
+        ? _AppShellColors.sos
+        : (isActive ? _AppShellColors.bleActive : _AppShellColors.bleInactive);
+    final label = hasError ? 'MESH ERROR' : (isActive ? 'MESH ON' : 'MESH OFF');
+    final labelColor = hasError
+        ? _AppShellColors.sos
+        : (isActive
+            ? _AppShellColors.bleActive
+            : _AppShellColors.bleInactiveLabel);
 
-    return AnimatedContainer(
-      duration: const Duration(milliseconds: 400),
-      curve: Curves.easeInOut,
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-      decoration: BoxDecoration(
-        color: isActive
-            ? _AppShellColors.bleActive.withValues(alpha: 0.10)
-            : _AppShellColors.bleInactive.withValues(alpha: 0.08),
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(
-          color: dotColor.withValues(alpha: isActive ? 0.35 : 0.20),
-          width: 1,
-        ),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          // Pulsing dot when active, static when not
-          isActive
-              ? _PulsingDot(color: dotColor)
-              : Container(
-                  width: 6,
-                  height: 6,
-                  decoration: BoxDecoration(
-                    color: dotColor,
-                    shape: BoxShape.circle,
-                  ),
-                ),
-          const SizedBox(width: 6),
-          Text(
-            label,
-            style: TextStyle(
-              color: labelColor,
-              fontSize: 10,
-              fontWeight: FontWeight.w700,
-              letterSpacing: 1.0,
-            ),
+    return GestureDetector(
+      onTap: onTap,
+      behavior: HitTestBehavior.opaque,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 400),
+        curve: Curves.easeInOut,
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+        decoration: BoxDecoration(
+          color: hasError
+              ? _AppShellColors.sos.withValues(alpha: 0.12)
+              : (isActive
+                  ? _AppShellColors.bleActive.withValues(alpha: 0.10)
+                  : _AppShellColors.bleInactive.withValues(alpha: 0.08)),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(
+            color: dotColor.withValues(alpha: (isActive || hasError) ? 0.35 : 0.20),
+            width: 1,
           ),
-        ],
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // Pulsing dot when active and healthy, static otherwise
+            (isActive && !hasError)
+                ? _PulsingDot(color: dotColor)
+                : Container(
+                    width: 6,
+                    height: 6,
+                    decoration: BoxDecoration(
+                      color: dotColor,
+                      shape: BoxShape.circle,
+                    ),
+                  ),
+            const SizedBox(width: 6),
+            Text(
+              label,
+              style: TextStyle(
+                color: labelColor,
+                fontSize: 10,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 1.0,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

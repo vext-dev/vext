@@ -69,6 +69,18 @@ typedef PeerCountChangedCallback = void Function(int count);
 typedef AdvertisingStateChangedCallback = void Function(
     bool isAdvertising, String error);
 
+/// Called when scan state changes.
+/// [isScanning] = true when FlutterBluePlus.startScan() succeeded.
+/// [error] = human-readable reason when starting the scan failed (empty on
+/// success). Added 2026-06-25: previously a scan failure (e.g. BLUETOOTH_SCAN /
+/// ACCESS_FINE_LOCATION denied) was caught and only debugPrint'd — completely
+/// invisible to the user, who would just see zero peers forever with no
+/// explanation. This is the most likely root cause of "nothing works without
+/// wifi" reports, since without an internet fallback the BLE mesh is the only
+/// transport, and its failures were silent.
+typedef ScanStateChangedCallback = void Function(
+    bool isScanning, String error);
+
 // ── Duty-cycle mode ────────────────────────────────────────────────────────────
 
 /// Controls how aggressively BLE scanning runs.
@@ -164,6 +176,11 @@ class BleTransportLayer {
   /// isAdvertising=true → Kotlin BleAdvertiser confirmed started.
   /// isAdvertising=false → error string explains why.
   AdvertisingStateChangedCallback? onAdvertisingStateChanged;
+
+  /// Fired immediately after every scan start attempt.
+  /// isScanning=true → FlutterBluePlus.startScan() succeeded.
+  /// isScanning=false → error string explains why (e.g. permission denied).
+  ScanStateChangedCallback? onScanStateChanged;
 
   // ── Subscriptions / timers ────────────────────────────────────────────────
 
@@ -814,9 +831,32 @@ class BleTransportLayer {
       await FlutterBluePlus.startScan(
         timeout: _scanDuration(),
       );
+      onScanStateChanged?.call(true, '');
     } catch (e) {
-      debugPrint('[BLE] startScan failed: $e');
+      // Surfaced via onScanStateChanged — NOT silently swallowed.
+      // (Previously this was a bare debugPrint with no UI signal at all; a
+      // denied BLUETOOTH_SCAN / ACCESS_FINE_LOCATION permission would fail
+      // here forever with zero indication to the user.)
+      final msg = _humanReadableScanError(e);
+      debugPrint('[BLE] startScan FAILED: $e');
+      onScanStateChanged?.call(false, msg);
     }
+  }
+
+  String _humanReadableScanError(Object e) {
+    final text = e.toString();
+    if (text.contains('SecurityException') ||
+        text.contains('PERMISSION') ||
+        text.contains('permission')) {
+      return 'Bluetooth/Location permission not granted. '
+          'Go to Settings → Apps → VEXT → Permissions → allow Nearby devices '
+          'and Location, then restart the app.';
+    }
+    if (text.contains('disabled') || text.contains('OFF')) {
+      return 'Bluetooth or Location is turned off on this device. '
+          'Turn both on, then restart the app.';
+    }
+    return 'BLE scan failed to start: $text';
   }
 
   void _scheduleDutyCycle() {
